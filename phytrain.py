@@ -1,4 +1,7 @@
-"""PhysMamba Trainer (FFT + CWT only training with FFT-major 20% schedule)."""
+"""PhysMamba Trainer (FFT + CWT spectral curriculum).
+FFT-major fraction is set inside this file only (self.frac_fft_major).
+Uses only FFT + CWT losses for training; validation still uses Neg_Pearson.
+"""
 
 import os
 from collections import OrderedDict
@@ -20,19 +23,11 @@ import torch.nn.functional as F
 # ---------------- Helper functions ----------------
 
 def spectral_log_magnitude(x, n_fft=256):
-    """
-    x: [B, T]
-    returns: log1p(|rfft(x)|) shape [B, n_fft//2 + 1]
-    """
     X = torch.fft.rfft(x, n=n_fft)
     mag = torch.abs(X)
     return torch.log1p(mag)
 
 def morlet_wavelet(freq, sr, width=6.0, duration=None):
-    """
-    Build a Morlet wavelet for center frequency `freq` (Hz).
-    Returns real, imag 1D tensors (cpu float32).
-    """
     if duration is None:
         cycles = 4.0
         duration = max(0.5, cycles / float(freq))
@@ -44,23 +39,17 @@ def morlet_wavelet(freq, sr, width=6.0, duration=None):
     gauss = torch.exp(-t**2 / (2 * sigma**2))
     real = gauss * torch.cos(2 * math.pi * freq * t)
     imag = gauss * torch.sin(2 * math.pi * freq * t)
-    # L1 normalize for stability in conv outputs
     real = real / (real.abs().sum() + 1e-12)
     imag = imag / (imag.abs().sum() + 1e-12)
     return real, imag
 
 def make_morlet_bank(freqs_hz, sr, device):
-    """
-    Build Morlet conv kernels for each frequency in freqs_hz.
-    Returns kernels_real, kernels_imag on `device` with shape [n_scales, 1, K].
-    """
     tmp = []
     max_len = 0
     for f in freqs_hz:
         r, im = morlet_wavelet(f, sr)
         tmp.append((r, im))
         max_len = max(max_len, r.numel())
-    # ensure odd common length
     if max_len % 2 == 0:
         max_len += 1
     kernels_r = []
@@ -78,25 +67,16 @@ def make_morlet_bank(freqs_hz, sr, device):
     return kernels_real, kernels_imag
 
 def cwt_magnitude_conv1d(x, kernels_real, kernels_imag):
-    """
-    Compute CWT magnitude by convolving with Morlet kernels.
-    x: [B, T] -> returns [B, n_scales, T]
-    """
-    x = x.unsqueeze(1)  # [B, 1, T]
+    x = x.unsqueeze(1)  # [B,1,T]
     kernel_size = kernels_real.shape[-1]
     pad = kernel_size // 2
-    # reflect padding to avoid step artifacts
     x_padded = F.pad(x, (pad, pad), mode='reflect')
-    real_out = F.conv1d(x_padded, kernels_real, padding=0)  # [B, n_scales, T]
+    real_out = F.conv1d(x_padded, kernels_real, padding=0)
     imag_out = F.conv1d(x_padded, kernels_imag, padding=0)
     mag = torch.sqrt(real_out**2 + imag_out**2 + 1e-12)
     return mag
 
 def cosine_interp(a0, a1, alpha):
-    """
-    Cosine interpolation between a0 (alpha=0) and a1 (alpha=1).
-    alpha in [0,1]
-    """
     mu = 0.5 * (1 - math.cos(math.pi * alpha))
     return (1 - mu) * a0 + mu * a1
 
@@ -105,7 +85,7 @@ def cosine_interp(a0, a1, alpha):
 class PhysMambaTrainer(BaseTrainer):
 
     def __init__(self, config, data_loader):
-        """Initialize trainer — preserves original fields and scheduler usage."""
+        """Initialize trainer."""
         super().__init__()
         self.device = torch.device(config.DEVICE)
         self.max_epoch_num = config.TRAIN.EPOCHS
@@ -122,75 +102,66 @@ class PhysMambaTrainer(BaseTrainer):
             self.diff_flag = 1
         self.frame_rate = config.TRAIN.DATA.FS
 
-        # model (keep same shape/placement as original)
+        # Model (same as original)
         self.model = PhysMamba().to(self.device)
         if self.num_of_gpu > 0:
             self.model = torch.nn.DataParallel(self.model, device_ids=list(range(config.NUM_OF_GPU_TRAIN)))
 
-        # optimizer & scheduler (same as original)
+        # Optimizer / scheduler (same defaults as original)
         if config.TOOLBOX_MODE == "train_and_test":
             self.num_train_batches = len(data_loader["train"])
-            # keep Pearson criterion instance for validation (original used Neg_Pearson)
             self.criterion_Pearson = Neg_Pearson()
             self.optimizer = optim.Adam(self.model.parameters(), lr=config.TRAIN.LR, weight_decay=0.0005)
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                self.optimizer, max_lr=config.TRAIN.LR, epochs=config.TRAIN.EPOCHS, steps_per_epoch=self.num_train_batches)
+                self.optimizer, max_lr=config.TRAIN.LR, epochs=config.TRAIN.EPOCHS, steps_per_epoch=max(1, self.num_train_batches))
         elif config.TOOLBOX_MODE == "only_test":
             self.criterion_Pearson_test = Neg_Pearson()
             pass
         else:
             raise ValueError("PhysMamba trainer initialized in incorrect toolbox mode!")
 
-    def _schedule_weights_fft_cwt(self, epoch, total_epochs,
-                                  frac_fft_major=0.2,
-                                  transition_frac=0.10,
-                                  w_fft_high=0.85,
-                                  w_fft_low=0.05):
-        """
-        Compute (w_fft, w_cwt) for given epoch.
+        # ---------------- Tune this one hyperparameter here ----------------
+        # Set this to the fraction of epochs during which FFT should be majority (0.0 - 1.0).
+        # Example: 0.4 -> FFT-major for first 40% of epochs.
+        self.frac_fft_major = 0.4
+        # ------------------------------------------------------------------
 
-        Math:
-        - Let E = total_epochs.
-        - Let E_major = floor(frac_fft_major * E)  (epochs where FFT must be majority).
-          This guarantees FFT is majority for exactly E_major epochs (0-indexed: epochs 0 .. E_major-1).
-        - Let E_transition = max(1, round(transition_frac * E)) (smooth transition window length).
-        - Transition starts at t_start = E_major and ends at t_end = E_major + E_transition.
-        - For epoch < t_start: w_fft = w_fft_high (FFT-major).
-        - For epoch >= t_end: w_fft = w_fft_low (CWT-major).
-        - For t_start <= epoch < t_end: interpolate smoothly with cosine between w_fft_high -> w_fft_low.
-        - w_cwt = 1 - w_fft (we use only spectral losses).
-        """
+        # Fixed schedule params (not exposed as external hyperparams)
+        self.transition_frac = 0.10   # fraction of epochs used for smooth transition (10%)
+        self.w_fft_high = 0.85        # FFT weight during majority period
+        self.w_fft_low = 0.05         # FFT weight after transition
+
+    def _compute_weights(self, epoch, total_epochs):
+        """Compute epoch-dependent spectral weights (w_fft, w_cwt)."""
         E = int(total_epochs)
-        E_major = int(math.floor(frac_fft_major * E))
-        E_transition = max(1, int(round(transition_frac * E)))
+        E_major = int(math.floor(self.frac_fft_major * E))
+        E_transition = max(1, int(round(self.transition_frac * E)))
         t_start = E_major
         t_end = E_major + E_transition
 
         if epoch < t_start:
-            w_fft = float(w_fft_high)
+            w_fft = self.w_fft_high
         elif epoch >= t_end:
-            w_fft = float(w_fft_low)
+            w_fft = self.w_fft_low
         else:
             alpha = float(epoch - t_start) / float(max(1, t_end - t_start))
-            w_fft = cosine_interp(w_fft_high, w_fft_low, alpha)
+            w_fft = cosine_interp(self.w_fft_high, self.w_fft_low, alpha)
         w_cwt = 1.0 - w_fft
-        return w_fft, w_cwt
+        return float(w_fft), float(w_cwt)
 
     def train(self, data_loader):
-        """Training routine using only FFT + CWT losses with the 20% FFT-major schedule."""
+        """Training routine using only FFT + CWT losses with the in-file FFT-major fraction."""
         if data_loader["train"] is None:
             raise ValueError("No data for train")
 
-        # CWT bank: choose scales that map to approx 0.5-4.0 Hz (HR band)
+        # CWT bank settings
         sr = int(self.frame_rate)
         n_scales = getattr(self.config, 'CWT', {}).get('N_SCALES', 32) if getattr(self.config, 'CWT', None) else 32
         freqs = torch.linspace(0.5, 4.0, n_scales).tolist()
         kernels_real, kernels_imag = make_morlet_bank(freqs, sr, self.device)
 
-        # FFT param
         n_fft = getattr(self.config, 'FFT', {}).get('N_FFT', 256) if getattr(self.config, 'FFT', None) else 256
 
-        # normalization baselines (computed from first batch)
         L0_fft = None
         L0_cwt = None
         eps = 1e-8
@@ -205,23 +176,13 @@ class PhysMambaTrainer(BaseTrainer):
             running_loss = 0.0
             tbar = tqdm(data_loader["train"], ncols=80)
 
-            # compute schedule weights; defaults:
-            # - frac_fft_major = 0.2 (FFT majority for first 20% epochs)
-            # - transition_frac = 0.10 (10% of epochs used for smooth transition)
-            # - w_fft_high = 0.85 (FFT weight during majority)
-            # - w_fft_low = 0.05  (FFT weight after transition)
-            w_fft, w_cwt = self._schedule_weights_fft_cwt(
-                epoch, total_epochs,
-                frac_fft_major=0.2,
-                transition_frac=0.10,
-                w_fft_high=0.85,
-                w_fft_low=0.05
-            )
+            # compute weights for this epoch (only frac set in-file)
+            w_fft, w_cwt = self._compute_weights(epoch, total_epochs)
 
-            # compute t_start to reduce LR and checkpoint at transition start (optional stabilizer)
+            # optionally reduce LR at transition start for stability
             E = total_epochs
-            E_major = int(math.floor(0.2 * E))
-            E_transition = max(1, int(round(0.10 * E)))
+            E_major = int(math.floor(self.frac_fft_major * E))
+            E_transition = max(1, int(round(self.transition_frac * E)))
             t_start = E_major
             if epoch == t_start and epoch > 0:
                 for g in self.optimizer.param_groups:
@@ -233,42 +194,37 @@ class PhysMambaTrainer(BaseTrainer):
             for idx, batch in enumerate(tbar):
                 tbar.set_description("Train epoch %s" % epoch)
                 data, labels = batch[0].float(), batch[1].float()
-                N, D, C, H, W = data.shape  # preserve original shape handling
+                N, D, C, H, W = data.shape
 
                 data = data.to(self.device)
                 labels = labels.to(self.device)
 
                 self.optimizer.zero_grad()
-                pred_ppg = self.model(data)  # model expected to return waveform in same shape as before
+                pred_ppg = self.model(data)
 
-                # preserve original normalization style exactly for compatibility:
-                # original: pred_ppg = (pred_ppg - torch.mean(pred_ppg, axis=-1).view(-1,1)) / torch.std(pred_ppg, axis=-1).view(-1,1)
-                # That treated each sample across time (axis=-1) per-row; replicate with keepdims
-                # handle different tensor shapes just in case
+                # reshape if needed and normalize (preserve original style)
                 if pred_ppg.dim() == 3 and pred_ppg.shape[1] == 1:
                     pred_ppg = pred_ppg.squeeze(1)
                 if pred_ppg.dim() == 3 and pred_ppg.shape[-1] == 1:
                     pred_ppg = pred_ppg.squeeze(-1)
 
-                # compute per-sample mean/std along last axis (time)
                 pred_mean = torch.mean(pred_ppg, dim=-1).view(-1, 1)
                 pred_std = torch.std(pred_ppg, dim=-1).view(-1, 1) + 1e-8
                 pred_ppg = (pred_ppg - pred_mean) / pred_std
 
-                # Original labels normalization in your code was global (no axis). To preserve behavior:
+                # original labels normalization (global)
                 labels = (labels - torch.mean(labels)) / (torch.std(labels) + 1e-8)
 
-                # --- FFT loss (log-magnitude MSE) ---
+                # FFT loss
                 fft_pred_log = spectral_log_magnitude(pred_ppg, n_fft=n_fft)
                 fft_target_log = spectral_log_magnitude(labels, n_fft=n_fft)
                 L_fft = F.mse_loss(fft_pred_log, fft_target_log, reduction='mean')
 
-                # --- CWT loss (log1p magnitude MSE) ---
+                # CWT loss
                 cwt_pred = cwt_magnitude_conv1d(pred_ppg, kernels_real, kernels_imag)
                 cwt_target = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
                 L_cwt = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_target), reduction='mean')
 
-                # init normalization baselines from first seen batch
                 if L0_fft is None:
                     L0_fft = max(L_fft.detach().item(), 1e-6)
                     L0_cwt = max(L_cwt.detach().item(), 1e-6)
@@ -277,7 +233,7 @@ class PhysMambaTrainer(BaseTrainer):
                 L_fft_norm = L_fft / (L0_fft + eps)
                 L_cwt_norm = L_cwt / (L0_cwt + eps)
 
-                # combined loss — only FFT + CWT (weights computed above)
+                # combined spectral-only loss
                 loss = float(w_fft) * L_fft_norm + float(w_cwt) * L_cwt_norm
 
                 loss.backward()
@@ -287,7 +243,6 @@ class PhysMambaTrainer(BaseTrainer):
                     running_loss = 0.0
 
                 self.optimizer.step()
-                # step scheduler (OneCycleLR expects step per batch)
                 try:
                     self.scheduler.step()
                 except Exception:
@@ -295,7 +250,7 @@ class PhysMambaTrainer(BaseTrainer):
 
                 tbar.set_postfix(loss=loss.item(), w_fft=w_fft, w_cwt=w_cwt)
 
-            # end of epoch
+            # end epoch
             self.save_model(epoch)
 
             if not self.config.TEST.USE_LAST_EPOCH:
@@ -311,12 +266,11 @@ class PhysMambaTrainer(BaseTrainer):
                     print("Update best model! Best epoch: {}".format(self.best_epoch))
             torch.cuda.empty_cache()
 
-        # training finished
         if not self.config.TEST.USE_LAST_EPOCH:
             print("best trained epoch: {}, min_val_loss: {}".format(self.best_epoch, self.min_valid_loss))
 
     def valid(self, data_loader):
-        """ Runs the model on valid sets using the same Pearson criterion as original."""
+        """Validation using Neg_Pearson (keeps original behavior)."""
         if data_loader["valid"] is None:
             raise ValueError("No data for valid")
 
@@ -333,16 +287,13 @@ class PhysMambaTrainer(BaseTrainer):
                     torch.float32).to(self.device)
                 rPPG = self.model(
                     valid_batch[0].to(torch.float32).to(self.device))
-                # reshape if model output has extra dims
                 if rPPG.dim() == 3 and rPPG.shape[1] == 1:
                     rPPG = rPPG.squeeze(1)
                 if rPPG.dim() == 3 and rPPG.shape[-1] == 1:
                     rPPG = rPPG.squeeze(-1)
 
-                # preserve original normalization style for validation as well (global label norm in original)
                 rPPG = (rPPG - torch.mean(rPPG, dim=-1).view(-1, 1)) / (torch.std(rPPG, dim=-1).view(-1, 1) + 1e-8)
                 BVP_label = (BVP_label - torch.mean(BVP_label)) / (torch.std(BVP_label) + 1e-8)
-
                 loss_ecg = self.criterion_Pearson(rPPG, BVP_label)
                 valid_loss.append(loss_ecg.item())
                 valid_step += 1
@@ -351,7 +302,7 @@ class PhysMambaTrainer(BaseTrainer):
         return np.mean(valid_loss)
 
     def test(self, data_loader):
-        """ Runs the model on test sets. (kept same shape/behavior as original)"""
+        """Testing routine (keeps original output shapes/behavior)."""
         if data_loader["test"] is None:
             raise ValueError("No data for test")
         
@@ -362,7 +313,7 @@ class PhysMambaTrainer(BaseTrainer):
 
         if self.config.TOOLBOX_MODE == "only_test":
             if not os.path.exists(self.config.INFERENCE.MODEL_PATH):
-                raise ValueError("Inference model path error! Please check INFERENCE.MODEL_PATH in your yaml.")
+                raise ValueError("Inference model path error! Please check INFERENCE.MODEL.PATH in your yaml.")
             self.model.load_state_dict(torch.load(self.config.INFERENCE.MODEL_PATH))
             print("Testing uses pretrained model!")
             print(self.config.INFERENCE.MODEL_PATH)
@@ -386,8 +337,7 @@ class PhysMambaTrainer(BaseTrainer):
         with torch.no_grad():
             for _, test_batch in enumerate(tqdm(data_loader["test"], ncols=80)):
                 batch_size = test_batch[0].shape[0]
-                data, label = test_batch[0].to(
-                    self.config.DEVICE), test_batch[1].to(self.config.DEVICE)
+                data, label = test_batch[0].to(self.config.DEVICE), test_batch[1].to(self.config.DEVICE)
                 pred_ppg_test = self.model(data)
 
                 if self.config.TEST.OUTPUT_SAVE_DIR:
@@ -405,7 +355,7 @@ class PhysMambaTrainer(BaseTrainer):
 
         print('')
         calculate_metrics(predictions, labels, self.config)
-        if self.config.TEST.OUTPUT_SAVE_DIR: # saving test outputs 
+        if self.config.TEST.OUTPUT_SAVE_DIR:
             self.save_test_outputs(predictions, labels, self.config)
 
     def save_model(self, index):
