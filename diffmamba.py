@@ -6,8 +6,14 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba
 from timm.models.layers import DropPath, trunc_normal_
 
+from neural_methods.model.layers import conv_block
+from neural_methods.model.layers import CDC_T
+from neural_methods.model.layers import ChannelAttention3D
+from neural_methods.model.layers import LateralConnection
+
+
 # ------------------------------------------------------------
-# Periodic State Kernel
+# Periodic State Kernel (new)
 # ------------------------------------------------------------
 
 class PeriodicStateKernel(nn.Module):
@@ -38,7 +44,7 @@ class PeriodicStateKernel(nn.Module):
 
 
 # ------------------------------------------------------------
-# Shared Mamba Wrapper
+# Shared Mamba Wrapper (new)
 # ------------------------------------------------------------
 
 class SharedMambaWrapper(nn.Module):
@@ -49,22 +55,23 @@ class SharedMambaWrapper(nn.Module):
 
     def forward(self, x):
 
-        out_f = self.block(x)
+        forward_out = self.block(x)
 
         x_rev = torch.flip(x, dims=[2])
-        out_b = self.block(x_rev)
-        out_b = torch.flip(out_b, dims=[2])
+        backward_out = self.block(x_rev)
+        backward_out = torch.flip(backward_out, dims=[2])
 
-        return 0.5 * (out_f + out_b)
+        return 0.5 * (forward_out + backward_out)
 
 
 # ------------------------------------------------------------
-# Mamba Layer
+# Standard Mamba Layer
 # ------------------------------------------------------------
 
 class MambaLayer(nn.Module):
 
     def __init__(self, dim, d_state=16, d_conv=4, expand=2):
+
         super().__init__()
 
         self.dim = dim
@@ -80,15 +87,30 @@ class MambaLayer(nn.Module):
             bimamba=True
         )
 
-        self.drop_path = nn.Identity()
+        drop_path = 0
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
     def forward_patch_token(self, x):
 
         B,C,T,H,W = x.shape
 
         n_tokens = x.shape[2:].numel()
+        img_dims = x.shape[2:]
 
-        x_flat = x.reshape(B,C,n_tokens).transpose(-1,-2)
+        x_flat = x.reshape(B, C, n_tokens).transpose(-1,-2)
 
         x_norm = self.norm1(x_flat)
 
@@ -96,12 +118,12 @@ class MambaLayer(nn.Module):
 
         x_out = self.norm2(x_flat + self.drop_path(x_mamba))
 
-        return x_out.transpose(-1,-2).reshape(B,C,T,H,W)
+        return x_out.transpose(-1,-2).reshape(B,C,*img_dims)
 
-    def forward(self,x):
+    def forward(self, x):
 
-        if x.dtype in [torch.float16, torch.bfloat16]:
-            x = x.float()
+        if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
+            x = x.type(torch.float32)
 
         return self.forward_patch_token(x)
 
@@ -112,11 +134,12 @@ class MambaLayer(nn.Module):
 
 class DiffMambaLayer(nn.Module):
 
-    def __init__(self, dim, d_state=16, d_conv=4):
+    def __init__(self, dim, d_state=16, d_conv=4, layer_idx=0):
 
         super().__init__()
 
         self.dim = dim
+        self.layer_idx = layer_idx
 
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -143,11 +166,12 @@ class DiffMambaLayer(nn.Module):
 
         self.subln = nn.LayerNorm(dim)
 
-    def forward_patch_token(self,x):
+    def forward_patch_token(self, x):
 
         B,C,T,H,W = x.shape
 
         n_tokens = x.shape[2:].numel()
+        img_dims = x.shape[2:]
 
         x_flat = x.reshape(B,C,n_tokens).transpose(-1,-2)
 
@@ -159,95 +183,128 @@ class DiffMambaLayer(nn.Module):
         lam = torch.sigmoid(self.lambda_q.sum())
 
         attn = y1 - lam * y2
-
         attn = self.subln(attn)
 
-        out = self.norm2(x_flat + attn)
+        x_out = self.norm2(x_flat + attn)
 
-        return out.transpose(-1,-2).reshape(B,C,T,H,W)
+        return x_out.transpose(-1,-2).reshape(B,C,*img_dims)
 
-    def forward(self,x):
+    def forward(self, x):
 
-        if x.dtype in [torch.float16, torch.bfloat16]:
-            x = x.float()
+        if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
+            x = x.type(torch.float32)
 
         return self.forward_patch_token(x)
 
 
 # ------------------------------------------------------------
-# PhysMamba
+# PhysMamba Model
 # ------------------------------------------------------------
 
 class PhysMamba(nn.Module):
 
-    def __init__(self, frames=128, diffmamba=False):
+    def __init__(self, theta=0.5, drop_rate1=0.25, drop_rate2=0.5,
+                 frames=128, diffmamba=False):
 
         super().__init__()
 
         self.periodic_kernel = PeriodicStateKernel(64)
 
         # Backbone
+        self.ConvBlock1 = conv_block(3,16,[1,5,5],stride=1,padding=[0,2,2])
+        self.ConvBlock2 = conv_block(16,32,[3,3,3],stride=1,padding=1)
+        self.ConvBlock3 = conv_block(32,64,[3,3,3],stride=1,padding=1)
 
-        self.ConvBlock1 = nn.Conv3d(3,16,(1,5,5),padding=(0,2,2))
-        self.ConvBlock2 = nn.Conv3d(16,32,3,padding=1)
-        self.ConvBlock3 = nn.Conv3d(32,64,3,padding=1)
+        self.ConvBlock4 = conv_block(64,64,[4,1,1],stride=[4,1,1],padding=0)
+        self.ConvBlock5 = conv_block(64,32,[2,1,1],stride=[2,1,1],padding=0)
+        self.ConvBlock6 = conv_block(32,32,[3,1,1],stride=1,padding=[1,0,0],activation='elu')
 
-        self.ConvBlock4 = nn.Conv3d(64,64,(4,1,1),stride=(4,1,1))
-        self.ConvBlock5 = nn.Conv3d(64,32,(2,1,1),stride=(2,1,1))
-
-        # Blocks
-
+        # Build base blocks
         if diffmamba:
-
             base_slow = DiffMambaLayer(64)
             base_fast = DiffMambaLayer(32)
-
         else:
-
             base_slow = MambaLayer(64)
             base_fast = MambaLayer(32)
 
+        # Shared blocks
         self.Block1 = SharedMambaWrapper(base_slow)
         self.Block2 = SharedMambaWrapper(base_slow)
 
         self.Block4 = SharedMambaWrapper(base_fast)
         self.Block5 = SharedMambaWrapper(base_fast)
 
+        # Removed redundant blocks safely
         self.Block3 = nn.Identity()
         self.Block6 = nn.Identity()
 
+        # Pooling
+        self.MaxpoolSpa = nn.MaxPool3d((1,2,2),(1,2,2))
+
+        # Lateral connections
+        self.fuse_1 = LateralConnection(fast_channels=32, slow_channels=64)
+        self.fuse_2 = LateralConnection(fast_channels=32, slow_channels=64)
+
         # Upsample
+        self.upsample1 = nn.Sequential(
+            nn.Upsample(scale_factor=(2,1,1)),
+            nn.Conv3d(64,64,[3,1,1],padding=(1,0,0)),
+            nn.BatchNorm3d(64),
+            nn.ELU()
+        )
 
-        self.upsample1 = nn.Upsample(scale_factor=(2,1,1))
-        self.upsample2 = nn.Upsample(scale_factor=(2,1,1))
+        self.upsample2 = nn.Sequential(
+            nn.Upsample(scale_factor=(2,1,1)),
+            nn.Conv3d(96,48,[3,1,1],padding=(1,0,0)),
+            nn.BatchNorm3d(48),
+            nn.ELU()
+        )
 
-        self.final_conv = nn.Conv3d(48,1,1)
+        self.ConvBlockLast = nn.Conv3d(48,1,[1,1,1])
 
         self.poolspa = nn.AdaptiveAvgPool3d((frames,1,1))
 
     def forward(self,x):
 
-        B,C,T,H,W = x.shape
+        batch,channel,length,width,height = x.shape
 
-        x = F.elu(self.ConvBlock1(x))
-        x = F.elu(self.ConvBlock2(x))
-        x = F.elu(self.ConvBlock3(x))
+        x = self.ConvBlock1(x)
+        x = self.MaxpoolSpa(x)
+
+        x = self.ConvBlock2(x)
+        x = self.ConvBlock3(x)
+        x = self.MaxpoolSpa(x)
 
         s_x = self.ConvBlock4(x)
         f_x = self.ConvBlock5(x)
 
         s_x = self.periodic_kernel(s_x)
 
+        # first fusion
         s_x1 = self.Block1(s_x)
+        s_x1 = self.MaxpoolSpa(s_x1)
+
         f_x1 = self.Block4(f_x)
+        f_x1 = self.MaxpoolSpa(f_x1)
 
+        s_x1 = self.fuse_1(s_x1,f_x1)
+
+        # second fusion
         s_x2 = self.Block2(s_x1)
-        f_x2 = self.Block5(f_x1)
+        s_x2 = self.MaxpoolSpa(s_x2)
 
+        f_x2 = self.Block5(f_x1)
+        f_x2 = self.MaxpoolSpa(f_x2)
+
+        s_x2 = self.fuse_2(s_x2,f_x2)
+
+        # removed third blocks
         s_x3 = s_x2
         f_x3 = f_x2
 
         s_x3 = self.upsample1(s_x3)
+
+        f_x3 = self.ConvBlock6(f_x3)
 
         x_fusion = torch.cat((f_x3,s_x3),dim=1)
 
@@ -255,8 +312,8 @@ class PhysMamba(nn.Module):
 
         x_final = self.poolspa(x_final)
 
-        x_final = self.final_conv(x_final)
+        x_final = self.ConvBlockLast(x_final)
 
-        rPPG = x_final.view(B,T)
+        rPPG = x_final.view(-1,length)
 
         return rPPG
