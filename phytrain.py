@@ -1,12 +1,13 @@
-"""PhysMamba Trainer (FFT + CWT spectral curriculum only)."""
+"""PhysMamba Trainer (FFT + CWT spectral curriculum)."""
 
 import os
 import math
 import numpy as np
 import torch
 import torch.optim as optim
-from tqdm import tqdm
 import torch.nn.functional as F
+
+from tqdm import tqdm
 from scipy.signal import welch
 
 from evaluation.metrics import calculate_metrics
@@ -124,14 +125,22 @@ class PhysMambaTrainer(BaseTrainer):
         self.max_epoch_num = config.TRAIN.EPOCHS
         self.frame_rate = config.TRAIN.DATA.FS
 
+        self.model_dir = config.MODEL.MODEL_DIR
+        self.model_file_name = config.TRAIN.MODEL_FILE_NAME
+        self.batch_size = config.TRAIN.BATCH_SIZE
+        self.num_of_gpu = config.NUM_OF_GPU_TRAIN
+
+        self.min_valid_loss = None
+        self.best_epoch = 0
+
         self.model = PhysMamba(
             frames=config.TRAIN.DATA.PREPROCESS.CHUNK_LENGTH
         ).to(self.device)
 
-        if config.NUM_OF_GPU_TRAIN > 0:
+        if self.num_of_gpu > 0:
             self.model = torch.nn.DataParallel(
                 self.model,
-                device_ids=list(range(config.NUM_OF_GPU_TRAIN))
+                device_ids=list(range(self.num_of_gpu))
             )
 
         self.criterion_Pearson = Neg_Pearson()
@@ -149,7 +158,34 @@ class PhysMambaTrainer(BaseTrainer):
             steps_per_epoch=len(data_loader["train"])
         )
 
-    # ------------------------------------------------------------
+        # Spectral curriculum parameters
+        self.frac_fft_major = 0.4
+        self.transition_frac = 0.10
+        self.w_fft_high = 0.85
+        self.w_fft_low = 0.05
+
+
+    def _compute_weights(self, epoch):
+
+        E = self.max_epoch_num
+        E_major = int(math.floor(self.frac_fft_major * E))
+        E_transition = max(1, int(round(self.transition_frac * E)))
+
+        t_start = E_major
+        t_end = E_major + E_transition
+
+        if epoch < t_start:
+            w_fft = self.w_fft_high
+        elif epoch >= t_end:
+            w_fft = self.w_fft_low
+        else:
+            alpha = float(epoch - t_start) / float(max(1, t_end - t_start))
+            w_fft = cosine_interp(self.w_fft_high, self.w_fft_low, alpha)
+
+        w_cwt = 1.0 - w_fft
+
+        return float(w_fft), float(w_cwt)
+
 
     def train(self, data_loader):
 
@@ -157,20 +193,21 @@ class PhysMambaTrainer(BaseTrainer):
 
         freqs = torch.linspace(0.5, 4.0, 32).tolist()
 
-        kernels_real, kernels_imag = make_morlet_bank(
-            freqs, sr, self.device
-        )
+        kernels_real, kernels_imag = make_morlet_bank(freqs, sr, self.device)
 
         n_fft = 256
 
         L0_fft = None
         L0_cwt = None
-
         eps = 1e-8
 
         for epoch in range(self.max_epoch_num):
 
             print(f"\n==== Training Epoch {epoch} ====")
+
+            w_fft, w_cwt = self._compute_weights(epoch)
+
+            print(f"Spectral weights → FFT:{w_fft:.3f} CWT:{w_cwt:.3f}")
 
             self.model.train()
 
@@ -187,10 +224,6 @@ class PhysMambaTrainer(BaseTrainer):
 
                 pred_ppg = self.model(data)
 
-                # -----------------------------------------
-                # Ensure temporal lengths match
-                # -----------------------------------------
-
                 if pred_ppg.shape[-1] != labels.shape[-1]:
 
                     pred_ppg = F.interpolate(
@@ -200,36 +233,21 @@ class PhysMambaTrainer(BaseTrainer):
                         align_corners=False
                     ).squeeze(1)
 
-                # -----------------------------------------
-                # Normalize predictions
-                # -----------------------------------------
-
                 pred_mean = torch.mean(pred_ppg, dim=-1).view(-1, 1)
                 pred_std = torch.std(pred_ppg, dim=-1).view(-1, 1) + 1e-8
-
                 pred_ppg = (pred_ppg - pred_mean) / pred_std
 
                 labels = (labels - torch.mean(labels)) / (torch.std(labels) + 1e-8)
-
-                # -----------------------------------------
-                # FFT loss
-                # -----------------------------------------
 
                 fft_pred = spectral_log_magnitude(pred_ppg, n_fft)
                 fft_gt = spectral_log_magnitude(labels, n_fft)
 
                 L_fft = F.mse_loss(fft_pred, fft_gt)
 
-                # -----------------------------------------
-                # CWT loss
-                # -----------------------------------------
-
                 cwt_pred = cwt_magnitude_conv1d(pred_ppg, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
 
                 L_cwt = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
-
-                # -----------------------------------------
 
                 if L0_fft is None:
                     L0_fft = max(L_fft.detach().item(), 1e-6)
@@ -238,18 +256,32 @@ class PhysMambaTrainer(BaseTrainer):
                 L_fft_norm = L_fft / (L0_fft + eps)
                 L_cwt_norm = L_cwt / (L0_cwt + eps)
 
-                loss = 0.85 * L_fft_norm + 0.15 * L_cwt_norm
+                loss = w_fft * L_fft_norm + w_cwt * L_cwt_norm
 
                 loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                 self.optimizer.step()
                 self.scheduler.step()
 
-                tbar.set_postfix(loss=loss.item())
+                tbar.set_postfix(loss=loss.item(), w_fft=w_fft, w_cwt=w_cwt)
+
+            self.save_model(epoch)
+
+            valid_loss = self.valid(data_loader)
+
+            print("validation loss:", valid_loss)
+
+            if self.min_valid_loss is None or valid_loss < self.min_valid_loss:
+                self.min_valid_loss = valid_loss
+                self.best_epoch = epoch
+                print("Update best model! Best epoch:", self.best_epoch)
+
+            torch.cuda.empty_cache()
 
         print("Training finished.")
 
-    # ------------------------------------------------------------
 
     def valid(self, data_loader):
 
@@ -276,7 +308,6 @@ class PhysMambaTrainer(BaseTrainer):
                     ).squeeze(1)
 
                 pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
-
                 label = (label - label.mean()) / (label.std() + 1e-8)
 
                 loss = self.criterion_Pearson(pred, label)
@@ -284,3 +315,84 @@ class PhysMambaTrainer(BaseTrainer):
                 valid_loss.append(loss.item())
 
         return np.mean(valid_loss)
+
+
+    def test(self, data_loader):
+
+        if data_loader["test"] is None:
+            raise ValueError("No data for test")
+
+        print("\n===Testing===")
+
+        predictions = dict()
+        labels = dict()
+
+        if self.config.TEST.USE_LAST_EPOCH:
+
+            model_path = os.path.join(
+                self.model_dir,
+                self.model_file_name + '_Epoch' + str(self.max_epoch_num - 1) + '.pth'
+            )
+
+        else:
+
+            model_path = os.path.join(
+                self.model_dir,
+                self.model_file_name + '_Epoch' + str(self.best_epoch) + '.pth'
+            )
+
+        print("Loading model:", model_path)
+
+        self.model.load_state_dict(torch.load(model_path))
+
+        self.model = self.model.to(self.config.DEVICE)
+        self.model.eval()
+
+        with torch.no_grad():
+
+            for _, test_batch in enumerate(tqdm(data_loader["test"], ncols=80)):
+
+                batch_size = test_batch[0].shape[0]
+
+                data = test_batch[0].to(self.config.DEVICE)
+                label = test_batch[1].to(self.config.DEVICE)
+
+                pred_ppg_test = self.model(data)
+
+                for idx in range(batch_size):
+
+                    subj_index = test_batch[2][idx]
+                    sort_index = int(test_batch[3][idx])
+
+                    if subj_index not in predictions:
+                        predictions[subj_index] = dict()
+                        labels[subj_index] = dict()
+
+                    predictions[subj_index][sort_index] = pred_ppg_test[idx].detach().cpu()
+                    labels[subj_index][sort_index] = label[idx].detach().cpu()
+
+        calculate_metrics(predictions, labels, self.config)
+
+
+    def save_model(self, index):
+
+        if not os.path.exists(self.model_dir):
+            os.makedirs(self.model_dir)
+
+        model_path = os.path.join(
+            self.model_dir,
+            self.model_file_name + '_Epoch' + str(index) + '.pth'
+        )
+
+        torch.save(self.model.state_dict(), model_path)
+
+        print("Saved Model Path:", model_path)
+
+
+    def get_hr(self, y, sr=30, min=30, max=180):
+
+        p, q = welch(y, sr, nfft=1e5/sr, nperseg=np.min((len(y)-1, 256)))
+
+        return p[(p > min/60) & (p < max/60)][
+            np.argmax(q[(p > min/60) & (p < max/60)])
+        ] * 60
