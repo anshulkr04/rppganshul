@@ -1,4 +1,4 @@
-"""PhysMamba Trainer (FFT + CWT spectral curriculum)."""
+"""PhysMamba Trainer (FFT + CWT + Pearson curriculum)."""
 
 import os
 import math
@@ -127,6 +127,7 @@ class PhysMambaTrainer(BaseTrainer):
 
         self.model_dir = config.MODEL.MODEL_DIR
         self.model_file_name = config.TRAIN.MODEL_FILE_NAME
+
         self.batch_size = config.TRAIN.BATCH_SIZE
         self.num_of_gpu = config.NUM_OF_GPU_TRAIN
 
@@ -158,7 +159,7 @@ class PhysMambaTrainer(BaseTrainer):
             steps_per_epoch=len(data_loader["train"])
         )
 
-        # Spectral curriculum parameters
+        # curriculum
         self.frac_fft_major = 0.4
         self.transition_frac = 0.10
         self.w_fft_high = 0.85
@@ -168,6 +169,7 @@ class PhysMambaTrainer(BaseTrainer):
     def _compute_weights(self, epoch):
 
         E = self.max_epoch_num
+
         E_major = int(math.floor(self.frac_fft_major * E))
         E_transition = max(1, int(round(self.transition_frac * E)))
 
@@ -176,8 +178,10 @@ class PhysMambaTrainer(BaseTrainer):
 
         if epoch < t_start:
             w_fft = self.w_fft_high
+
         elif epoch >= t_end:
             w_fft = self.w_fft_low
+
         else:
             alpha = float(epoch - t_start) / float(max(1, t_end - t_start))
             w_fft = cosine_interp(self.w_fft_high, self.w_fft_low, alpha)
@@ -186,6 +190,10 @@ class PhysMambaTrainer(BaseTrainer):
 
         return float(w_fft), float(w_cwt)
 
+
+    # ------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------
 
     def train(self, data_loader):
 
@@ -233,30 +241,50 @@ class PhysMambaTrainer(BaseTrainer):
                         align_corners=False
                     ).squeeze(1)
 
-                pred_mean = torch.mean(pred_ppg, dim=-1).view(-1, 1)
-                pred_std = torch.std(pred_ppg, dim=-1).view(-1, 1) + 1e-8
-                pred_ppg = (pred_ppg - pred_mean) / pred_std
+                # normalize prediction
+                pred_ppg = (
+                    pred_ppg - pred_ppg.mean(dim=-1, keepdim=True)
+                ) / (pred_ppg.std(dim=-1, keepdim=True) + 1e-8)
 
-                labels = (labels - torch.mean(labels)) / (torch.std(labels) + 1e-8)
+                # normalize labels (FIXED)
+                labels = (
+                    labels - labels.mean(dim=-1, keepdim=True)
+                ) / (labels.std(dim=-1, keepdim=True) + 1e-8)
 
+                # remove DC bias
+                pred_ppg = pred_ppg - pred_ppg.mean(dim=-1, keepdim=True)
+                labels = labels - labels.mean(dim=-1, keepdim=True)
+
+                # Pearson loss
+                L_pearson = self.criterion_Pearson(pred_ppg, labels)
+
+                # FFT loss
                 fft_pred = spectral_log_magnitude(pred_ppg, n_fft)
                 fft_gt = spectral_log_magnitude(labels, n_fft)
-
                 L_fft = F.mse_loss(fft_pred, fft_gt)
 
+                # CWT loss
                 cwt_pred = cwt_magnitude_conv1d(pred_ppg, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
 
-                L_cwt = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
+                L_cwt = F.mse_loss(
+                    torch.log1p(cwt_pred),
+                    torch.log1p(cwt_gt)
+                )
 
                 if L0_fft is None:
+
                     L0_fft = max(L_fft.detach().item(), 1e-6)
                     L0_cwt = max(L_cwt.detach().item(), 1e-6)
 
                 L_fft_norm = L_fft / (L0_fft + eps)
                 L_cwt_norm = L_cwt / (L0_cwt + eps)
 
-                loss = w_fft * L_fft_norm + w_cwt * L_cwt_norm
+                loss = (
+                    0.5 * L_pearson
+                    + 0.3 * w_fft * L_fft_norm
+                    + 0.2 * w_cwt * L_cwt_norm
+                )
 
                 loss.backward()
 
@@ -265,7 +293,12 @@ class PhysMambaTrainer(BaseTrainer):
                 self.optimizer.step()
                 self.scheduler.step()
 
-                tbar.set_postfix(loss=loss.item(), w_fft=w_fft, w_cwt=w_cwt)
+                tbar.set_postfix(
+                    loss=loss.item(),
+                    pearson=L_pearson.item(),
+                    w_fft=w_fft,
+                    w_cwt=w_cwt
+                )
 
             self.save_model(epoch)
 
@@ -274,14 +307,20 @@ class PhysMambaTrainer(BaseTrainer):
             print("validation loss:", valid_loss)
 
             if self.min_valid_loss is None or valid_loss < self.min_valid_loss:
+
                 self.min_valid_loss = valid_loss
                 self.best_epoch = epoch
+
                 print("Update best model! Best epoch:", self.best_epoch)
 
             torch.cuda.empty_cache()
 
         print("Training finished.")
 
+
+    # ------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------
 
     def valid(self, data_loader):
 
@@ -308,7 +347,7 @@ class PhysMambaTrainer(BaseTrainer):
                     ).squeeze(1)
 
                 pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
-                label = (label - label.mean()) / (label.std() + 1e-8)
+                label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True) + 1e-8)
 
                 loss = self.criterion_Pearson(pred, label)
 
@@ -316,6 +355,10 @@ class PhysMambaTrainer(BaseTrainer):
 
         return np.mean(valid_loss)
 
+
+    # ------------------------------------------------------------
+    # Testing
+    # ------------------------------------------------------------
 
     def test(self, data_loader):
 
@@ -373,6 +416,10 @@ class PhysMambaTrainer(BaseTrainer):
 
         calculate_metrics(predictions, labels, self.config)
 
+
+    # ------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------
 
     def save_model(self, index):
 
