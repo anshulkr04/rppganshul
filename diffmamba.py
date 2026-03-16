@@ -8,107 +8,13 @@ from timm.models.layers import DropPath, trunc_normal_
 
 
 # ------------------------------------------------------------
-# Attention
+# Conv Block
 # ------------------------------------------------------------
 
-class ChannelAttention3D(nn.Module):
-    def __init__(self, in_channels, reduction):
-        super().__init__()
-
-        self.avg_pool = nn.AdaptiveAvgPool3d(1)
-        self.max_pool = nn.AdaptiveMaxPool3d(1)
-
-        self.fc = nn.Sequential(
-            nn.Conv3d(in_channels, in_channels // reduction, 1, bias=False),
-            nn.ReLU(),
-            nn.Conv3d(in_channels // reduction, in_channels, 1, bias=False)
-        )
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-
-        avg = self.fc(self.avg_pool(x))
-        mx = self.fc(self.max_pool(x))
-
-        att = self.sigmoid(avg + mx)
-
-        return x * att
-
-
-# ------------------------------------------------------------
-# Lateral connection
-# ------------------------------------------------------------
-
-class LateralConnection(nn.Module):
-
-    def __init__(self, fast_channels=32, slow_channels=64):
-
-        super().__init__()
-
-        self.conv = nn.Sequential(
-            nn.Conv3d(fast_channels, slow_channels, [3,1,1], stride=[2,1,1], padding=[1,0,0]),
-            nn.BatchNorm3d(slow_channels),
-            nn.ReLU()
-        )
-
-    def forward(self, slow_path, fast_path):
-
-        fast_path = self.conv(fast_path)
-
-        return slow_path + fast_path
-
-
-# ------------------------------------------------------------
-# CDC temporal conv
-# ------------------------------------------------------------
-
-class CDC_T(nn.Module):
-
-    def __init__(self, in_channels, out_channels,
-                 kernel_size=3, stride=1, padding=1,
-                 theta=0.2):
-
-        super().__init__()
-
-        self.conv = nn.Conv3d(in_channels, out_channels,
-                              kernel_size, stride, padding)
-
-        self.theta = theta
-
-    def forward(self, x):
-
-        out_normal = self.conv(x)
-
-        if abs(self.theta) < 1e-8:
-            return out_normal
-
-        weight = self.conv.weight
-
-        if weight.shape[2] > 1:
-
-            kernel_diff = weight[:,:,0,:,:].sum((2,3)) + weight[:,:,2,:,:].sum((2,3))
-            kernel_diff = kernel_diff[:,:,None,None,None]
-
-            out_diff = F.conv3d(x, kernel_diff,
-                                stride=self.conv.stride,
-                                groups=self.conv.groups)
-
-            return out_normal - self.theta * out_diff
-
-        return out_normal
-
-
-# ------------------------------------------------------------
-# Conv block
-# ------------------------------------------------------------
-
-def conv_block(in_channels, out_channels,
-               kernel_size, stride, padding,
+def conv_block(in_channels, out_channels, kernel_size, stride, padding,
                bn=True, activation='relu'):
 
-    layers = [nn.Conv3d(in_channels, out_channels,
-                        kernel_size, stride, padding)]
+    layers = [nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)]
 
     if bn:
         layers.append(nn.BatchNorm3d(out_channels))
@@ -122,7 +28,33 @@ def conv_block(in_channels, out_channels,
 
 
 # ------------------------------------------------------------
-# Temporal MultiScale block (NEW)
+# Lateral Connection (SlowFast)
+# ------------------------------------------------------------
+
+class LateralConnection(nn.Module):
+
+    def __init__(self, fast_channels=32, slow_channels=64):
+
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv3d(fast_channels, slow_channels,
+                      kernel_size=[3,1,1],
+                      stride=[2,1,1],
+                      padding=[1,0,0]),
+            nn.BatchNorm3d(slow_channels),
+            nn.ReLU()
+        )
+
+    def forward(self, slow_path, fast_path):
+
+        fast_path = self.conv(fast_path)
+
+        return slow_path + fast_path
+
+
+# ------------------------------------------------------------
+# Temporal Multi-Scale Block
 # ------------------------------------------------------------
 
 class TemporalMultiScale(nn.Module):
@@ -131,16 +63,28 @@ class TemporalMultiScale(nn.Module):
 
         super().__init__()
 
-        self.conv3 = nn.Conv3d(channels, channels, (3,1,1),
-                               padding=(1,0,0), groups=channels)
+        self.conv3 = nn.Conv3d(
+            channels, channels,
+            (3,1,1),
+            padding=(1,0,0),
+            groups=channels
+        )
 
-        self.conv7 = nn.Conv3d(channels, channels, (7,1,1),
-                               padding=(3,0,0), groups=channels)
+        self.conv7 = nn.Conv3d(
+            channels, channels,
+            (7,1,1),
+            padding=(3,0,0),
+            groups=channels
+        )
 
-        self.conv15 = nn.Conv3d(channels, channels, (15,1,1),
-                                padding=(7,0,0), groups=channels)
+        self.conv15 = nn.Conv3d(
+            channels, channels,
+            (15,1,1),
+            padding=(7,0,0),
+            groups=channels
+        )
 
-        self.fuse = nn.Conv3d(channels*3, channels, 1)
+        self.pointwise = nn.Conv3d(channels*3, channels, 1)
 
         self.bn = nn.BatchNorm3d(channels)
         self.act = nn.GELU()
@@ -153,14 +97,14 @@ class TemporalMultiScale(nn.Module):
 
         out = torch.cat([f1,f2,f3], dim=1)
 
-        out = self.fuse(out)
+        out = self.pointwise(out)
         out = self.bn(out)
 
         return x + self.act(out)
 
 
 # ------------------------------------------------------------
-# Periodic kernel
+# Periodic State Kernel
 # ------------------------------------------------------------
 
 class PeriodicStateKernel(nn.Module):
@@ -182,7 +126,8 @@ class PeriodicStateKernel(nn.Module):
 
         freq = torch.clamp(self.freq,0.7,4.0)
 
-        sinusoid = torch.sin(2 * torch.pi * freq * t)
+        sinusoid = torch.sin(2*torch.pi*freq*t)
+
         sinusoid = sinusoid.view(1,1,T,1,1)
 
         amp = self.amp.view(1,C,1,1,1)
@@ -191,7 +136,7 @@ class PeriodicStateKernel(nn.Module):
 
 
 # ------------------------------------------------------------
-# Mamba layer
+# Mamba Layer
 # ------------------------------------------------------------
 
 class MambaLayer(nn.Module):
@@ -226,7 +171,7 @@ class MambaLayer(nn.Module):
 
 
 # ------------------------------------------------------------
-# Temporal Refiner (NEW)
+# Temporal Refiner
 # ------------------------------------------------------------
 
 class TemporalRefiner(nn.Module):
@@ -235,11 +180,19 @@ class TemporalRefiner(nn.Module):
 
         super().__init__()
 
-        self.conv1 = nn.Conv3d(channels, channels,
-                               (5,1,1), padding=(2,0,0))
+        self.conv1 = nn.Conv3d(
+            channels,
+            channels,
+            (5,1,1),
+            padding=(2,0,0)
+        )
 
-        self.conv2 = nn.Conv3d(channels, channels,
-                               (3,1,1), padding=(1,0,0))
+        self.conv2 = nn.Conv3d(
+            channels,
+            channels,
+            (3,1,1),
+            padding=(1,0,0)
+        )
 
         self.bn1 = nn.BatchNorm3d(channels)
         self.bn2 = nn.BatchNorm3d(channels)
@@ -253,7 +206,7 @@ class TemporalRefiner(nn.Module):
         x = self.act(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
 
-        return self.act(x + r)
+        return self.act(x+r)
 
 
 # ------------------------------------------------------------
@@ -262,7 +215,9 @@ class TemporalRefiner(nn.Module):
 
 class PhysMamba(nn.Module):
 
-    def __init__(self, theta=0.5, frames=128):
+    def __init__(self,
+                 theta=0.5,
+                 frames=128):
 
         super().__init__()
 
@@ -279,7 +234,9 @@ class PhysMamba(nn.Module):
 
         self.ConvBlock6 = conv_block(32,32,[3,1,1],1,[1,0,0],activation='elu')
 
-        # Temporal feature extraction
+        self.MaxpoolSpa = nn.MaxPool3d((1,2,2),(1,2,2))
+
+        # Temporal modules
         self.temporal_slow = TemporalMultiScale(64)
         self.temporal_fast = TemporalMultiScale(32)
 
@@ -291,8 +248,7 @@ class PhysMamba(nn.Module):
         self.Block4 = MambaLayer(32)
         self.Block5 = MambaLayer(32)
 
-        self.MaxpoolSpa = nn.MaxPool3d((1,2,2),(1,2,2))
-
+        # SlowFast fusion
         self.fuse_1 = LateralConnection(32,64)
         self.fuse_2 = LateralConnection(32,64)
 
@@ -317,7 +273,8 @@ class PhysMamba(nn.Module):
 
         self.poolspa = nn.AdaptiveAvgPool3d((frames,1,1))
 
-    def forward(self,x):
+
+    def forward(self, x):
 
         B,C,T,H,W = x.shape
 
