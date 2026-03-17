@@ -191,7 +191,7 @@ class MambaLayer(nn.Module):
         out = out.transpose(1, 2).unsqueeze(-1).unsqueeze(-1)  # (B, C, T, 1, 1)
 
         # expand spatially (DO NOT learn spatial here)
-        out = out.expand(-1, -1, -1, H, W)
+        out = out.expand(-1, -1, -1, H, W) * torch.sigmoid(x)
 
         return out
 
