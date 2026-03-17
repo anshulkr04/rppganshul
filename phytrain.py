@@ -1,4 +1,4 @@
-"""PhysMamba Trainer (FINAL - Stable + FFT + CWT + Temporal + Pearson)"""
+"""FINAL PhysMamba Trainer (Temporal-Mamba + FFT + CWT + Pearson)"""
 
 import os
 import math
@@ -26,7 +26,7 @@ def spectral_log_magnitude(x, n_fft=256):
 
 
 # ------------------------------------------------------------
-# Temporal loss
+# TEMPORAL LOSS
 # ------------------------------------------------------------
 
 def temporal_diff_loss(x, y):
@@ -111,7 +111,7 @@ def cwt_magnitude_conv1d(x, kernels_r, kernels_i):
 
 
 # ------------------------------------------------------------
-# Cosine interpolation
+# COSINE SCHEDULER
 # ------------------------------------------------------------
 
 def cosine_interp(a0, a1, alpha):
@@ -141,11 +141,9 @@ class PhysMambaTrainer(BaseTrainer):
         self.batch_size = config.TRAIN.BATCH_SIZE
         self.num_of_gpu = config.NUM_OF_GPU_TRAIN
 
-        # IMPORTANT
         self.min_valid_loss = None
         self.best_epoch = 0
 
-        # Model
         self.model = PhysMamba(
             frames=config.TRAIN.DATA.PREPROCESS.CHUNK_LENGTH
         ).to(self.device)
@@ -244,7 +242,10 @@ class PhysMambaTrainer(BaseTrainer):
                 cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
 
-                Lc = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
+                Lc = F.mse_loss(
+                    torch.log1p(cwt_pred),
+                    torch.log1p(cwt_gt)
+                )
 
                 loss = (
                     0.5 * Lp +
