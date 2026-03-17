@@ -1,4 +1,4 @@
-"""PhysMamba Trainer (Stable + Complete + Improved Loss)"""
+"""PhysMamba Trainer (FINAL - Stable + FFT + CWT + Temporal + Pearson)"""
 
 import os
 import math
@@ -17,7 +17,7 @@ from neural_methods.trainer.BaseTrainer import BaseTrainer
 
 
 # ------------------------------------------------------------
-# Helper functions
+# FFT
 # ------------------------------------------------------------
 
 def spectral_log_magnitude(x, n_fft=256):
@@ -25,21 +25,94 @@ def spectral_log_magnitude(x, n_fft=256):
     return torch.log1p(torch.abs(X))
 
 
+# ------------------------------------------------------------
+# Temporal loss
+# ------------------------------------------------------------
+
 def temporal_diff_loss(x, y):
     dx = x[:, 1:] - x[:, :-1]
     dy = y[:, 1:] - y[:, :-1]
     return F.l1_loss(dx, dy)
 
 
-def bandpass_loss(x, sr=30):
-    X = torch.fft.rfft(x, dim=-1)
-    freqs = torch.fft.rfftfreq(x.shape[-1], d=1/sr).to(x.device)
+# ------------------------------------------------------------
+# CWT (Morlet)
+# ------------------------------------------------------------
 
-    mask = (freqs >= 0.7) & (freqs <= 4.0)
-    power = torch.abs(X)**2
+def morlet_wavelet(freq, sr, width=6.0):
 
-    return -power[:, mask].mean()
+    cycles = 4.0
+    duration = max(0.5, cycles / float(freq))
 
+    total_samples = int(max(3, round(duration * sr)))
+    if total_samples % 2 == 0:
+        total_samples += 1
+
+    t = (torch.arange(total_samples) - total_samples // 2) / sr
+
+    sigma = width / (2 * math.pi * freq)
+    gauss = torch.exp(-t**2 / (2 * sigma**2))
+
+    real = gauss * torch.cos(2 * math.pi * freq * t)
+    imag = gauss * torch.sin(2 * math.pi * freq * t)
+
+    real /= (real.abs().sum() + 1e-12)
+    imag /= (imag.abs().sum() + 1e-12)
+
+    return real, imag
+
+
+def make_morlet_bank(freqs, sr, device):
+
+    temp = []
+    max_len = 0
+
+    for f in freqs:
+        r, i = morlet_wavelet(f, sr)
+        temp.append((r, i))
+        max_len = max(max_len, r.numel())
+
+    if max_len % 2 == 0:
+        max_len += 1
+
+    kernels_r, kernels_i = [], []
+
+    for r, i in temp:
+
+        pad = max_len - r.numel()
+        left = pad // 2
+        right = pad - left
+
+        r = F.pad(r, (left, right))
+        i = F.pad(i, (left, right))
+
+        kernels_r.append(r.view(1, 1, -1))
+        kernels_i.append(i.view(1, 1, -1))
+
+    kernels_r = torch.cat(kernels_r, dim=0).to(device)
+    kernels_i = torch.cat(kernels_i, dim=0).to(device)
+
+    return kernels_r, kernels_i
+
+
+def cwt_magnitude_conv1d(x, kernels_r, kernels_i):
+
+    x = x.unsqueeze(1)
+
+    k = kernels_r.shape[-1]
+    pad = k // 2
+
+    x = F.pad(x, (pad, pad), mode='reflect')
+
+    real = F.conv1d(x, kernels_r)
+    imag = F.conv1d(x, kernels_i)
+
+    return torch.sqrt(real**2 + imag**2 + 1e-12)
+
+
+# ------------------------------------------------------------
+# Cosine interpolation
+# ------------------------------------------------------------
 
 def cosine_interp(a0, a1, alpha):
     mu = 0.5 * (1 - math.cos(math.pi * alpha))
@@ -47,7 +120,7 @@ def cosine_interp(a0, a1, alpha):
 
 
 # ------------------------------------------------------------
-# Trainer
+# TRAINER
 # ------------------------------------------------------------
 
 class PhysMambaTrainer(BaseTrainer):
@@ -56,7 +129,6 @@ class PhysMambaTrainer(BaseTrainer):
 
         super().__init__()
 
-        # 🔥 IMPORTANT: restore ALL attributes
         self.device = torch.device(config.DEVICE)
         self.config = config
 
@@ -69,8 +141,9 @@ class PhysMambaTrainer(BaseTrainer):
         self.batch_size = config.TRAIN.BATCH_SIZE
         self.num_of_gpu = config.NUM_OF_GPU_TRAIN
 
-        self.min_valid_loss = None   # ✅ FIXED
-        self.best_epoch = 0          # ✅ FIXED
+        # IMPORTANT
+        self.min_valid_loss = None
+        self.best_epoch = 0
 
         # Model
         self.model = PhysMamba(
@@ -83,10 +156,8 @@ class PhysMambaTrainer(BaseTrainer):
                 device_ids=list(range(self.num_of_gpu))
             )
 
-        # Loss
         self.criterion_Pearson = Neg_Pearson()
 
-        # Optimizer
         self.optimizer = optim.Adam(
             self.model.parameters(),
             lr=config.TRAIN.LR,
@@ -100,7 +171,6 @@ class PhysMambaTrainer(BaseTrainer):
             steps_per_epoch=len(data_loader["train"])
         )
 
-        # curriculum params
         self.frac_fft_major = 0.4
         self.transition_frac = 0.1
 
@@ -119,19 +189,16 @@ class PhysMambaTrainer(BaseTrainer):
             alpha = (epoch - E_major) / E_transition
             w_fft = cosine_interp(0.85, 0.05, alpha)
 
-        w_cwt = min(1 - w_fft, 0.6)
-
+        w_cwt = 1 - w_fft
         return w_fft, w_cwt
 
 
-    # ------------------------------------------------------------
-    # TRAIN
-    # ------------------------------------------------------------
-
     def train(self, data_loader):
 
-        n_fft = 256
         sr = int(self.frame_rate)
+        freqs = torch.linspace(0.5, 4.0, 32).tolist()
+
+        kernels_real, kernels_imag = make_morlet_bank(freqs, sr, self.device)
 
         for epoch in range(self.max_epoch_num):
 
@@ -153,7 +220,6 @@ class PhysMambaTrainer(BaseTrainer):
 
                 pred = self.model(data)
 
-                # match length
                 if pred.shape[-1] != labels.shape[-1]:
                     pred = F.interpolate(
                         pred.unsqueeze(1),
@@ -162,30 +228,29 @@ class PhysMambaTrainer(BaseTrainer):
                         align_corners=False
                     ).squeeze(1)
 
-                # normalize (per sample)
+                # Normalize
                 pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
                 labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
-
-                # remove DC
-                pred = pred - pred.mean(dim=-1, keepdim=True)
-                labels = labels - labels.mean(dim=-1, keepdim=True)
 
                 # LOSSES
                 Lp = self.criterion_Pearson(pred, labels)
                 Lt = temporal_diff_loss(pred, labels)
-                Lb = bandpass_loss(pred, sr)
 
                 Lf = F.mse_loss(
-                    spectral_log_magnitude(pred, n_fft),
-                    spectral_log_magnitude(labels, n_fft)
+                    spectral_log_magnitude(pred),
+                    spectral_log_magnitude(labels)
                 )
 
-                # FINAL LOSS (stable)
+                cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
+                cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
+
+                Lc = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
+
                 loss = (
-                    0.6 * Lp +
+                    0.5 * Lp +
+                    0.2 * Lt +
                     0.2 * w_fft * Lf +
-                    0.15 * Lt +
-                    0.05 * Lb
+                    0.1 * w_cwt * Lc
                 )
 
                 loss.backward()
@@ -195,10 +260,8 @@ class PhysMambaTrainer(BaseTrainer):
                 self.optimizer.step()
                 self.scheduler.step()
 
-            # SAVE
             self.save_model(epoch)
 
-            # VALIDATE
             valid_loss = self.valid(data_loader)
 
             print("validation loss:", valid_loss)
@@ -213,14 +276,10 @@ class PhysMambaTrainer(BaseTrainer):
         print("Training finished.")
 
 
-    # ------------------------------------------------------------
-    # VALID
-    # ------------------------------------------------------------
-
     def valid(self, data_loader):
 
         self.model.eval()
-        valid_loss = []
+        losses = []
 
         with torch.no_grad():
 
@@ -235,23 +294,17 @@ class PhysMambaTrainer(BaseTrainer):
                     pred = F.interpolate(
                         pred.unsqueeze(1),
                         size=label.shape[-1],
-                        mode='linear',
-                        align_corners=False
+                        mode='linear'
                     ).squeeze(1)
 
                 pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True)+1e-8)
                 label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True)+1e-8)
 
                 loss = self.criterion_Pearson(pred, label)
+                losses.append(loss.item())
 
-                valid_loss.append(loss.item())
+        return np.mean(losses)
 
-        return np.mean(valid_loss)
-
-
-    # ------------------------------------------------------------
-    # TEST
-    # ------------------------------------------------------------
 
     def test(self, data_loader):
 
@@ -293,10 +346,6 @@ class PhysMambaTrainer(BaseTrainer):
         calculate_metrics(predictions, labels, self.config)
 
 
-    # ------------------------------------------------------------
-    # SAVE
-    # ------------------------------------------------------------
-
     def save_model(self, epoch):
 
         os.makedirs(self.model_dir, exist_ok=True)
@@ -307,13 +356,8 @@ class PhysMambaTrainer(BaseTrainer):
         )
 
         torch.save(self.model.state_dict(), path)
-
         print("Saved Model Path:", path)
 
-
-    # ------------------------------------------------------------
-    # HR
-    # ------------------------------------------------------------
 
     def get_hr(self, y, sr=30, min=30, max=180):
 
