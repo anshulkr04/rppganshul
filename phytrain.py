@@ -1,4 +1,4 @@
-"""PhysMamba Trainer (FFT + CWT + Pearson curriculum)."""
+"""PhysMamba Trainer (Improved: Pearson + FFT + CWT + Temporal + Bandpass)"""
 
 import os
 import math
@@ -22,91 +22,65 @@ from neural_methods.trainer.BaseTrainer import BaseTrainer
 
 def spectral_log_magnitude(x, n_fft=256):
     X = torch.fft.rfft(x, n=n_fft)
-    mag = torch.abs(X)
-    return torch.log1p(mag)
+    return torch.log1p(torch.abs(X))
 
 
-def morlet_wavelet(freq, sr, width=6.0, duration=None):
+def temporal_diff_loss(x, y):
+    dx = x[:, 1:] - x[:, :-1]
+    dy = y[:, 1:] - y[:, :-1]
+    return F.l1_loss(dx, dy)
 
-    if duration is None:
-        cycles = 4.0
-        duration = max(0.5, cycles / float(freq))
 
-    total_samples = int(max(3, round(duration * sr)))
+def bandpass_loss(x, sr=30):
+    X = torch.fft.rfft(x, dim=-1)
+    freqs = torch.fft.rfftfreq(x.shape[-1], d=1/sr).to(x.device)
 
-    if total_samples % 2 == 0:
-        total_samples += 1
+    mask = (freqs >= 0.7) & (freqs <= 4.0)
+    power = torch.abs(X)**2
 
-    t = (torch.arange(total_samples) - (total_samples // 2)) / float(sr)
+    return -power[:, mask].mean()
 
-    sigma = width / (2 * math.pi * freq)
+
+def morlet_wavelet(freq, sr):
+    t = torch.arange(int(sr*2)) / sr
+    sigma = 6.0 / (2 * math.pi * freq)
 
     gauss = torch.exp(-t**2 / (2 * sigma**2))
-
     real = gauss * torch.cos(2 * math.pi * freq * t)
     imag = gauss * torch.sin(2 * math.pi * freq * t)
 
-    real = real / (real.abs().sum() + 1e-12)
-    imag = imag / (imag.abs().sum() + 1e-12)
+    real /= (real.abs().sum() + 1e-12)
+    imag /= (imag.abs().sum() + 1e-12)
 
     return real, imag
 
 
-def make_morlet_bank(freqs_hz, sr, device):
+def make_morlet_bank(freqs, sr, device):
+    kernels_r, kernels_i = [], []
 
-    tmp = []
-    max_len = 0
+    for f in freqs:
+        r, i = morlet_wavelet(f, sr)
+        kernels_r.append(r.view(1,1,-1))
+        kernels_i.append(i.view(1,1,-1))
 
-    for f in freqs_hz:
-        r, im = morlet_wavelet(f, sr)
-        tmp.append((r, im))
-        max_len = max(max_len, r.numel())
-
-    if max_len % 2 == 0:
-        max_len += 1
-
-    kernels_r = []
-    kernels_i = []
-
-    for r, im in tmp:
-
-        pad = max_len - r.numel()
-        left = pad // 2
-        right = pad - left
-
-        rpad = F.pad(r, (left, right))
-        impad = F.pad(im, (left, right))
-
-        kernels_r.append(rpad.view(1, 1, -1))
-        kernels_i.append(impad.view(1, 1, -1))
-
-    kernels_real = torch.cat(kernels_r, dim=0).to(device)
-    kernels_imag = torch.cat(kernels_i, dim=0).to(device)
-
-    return kernels_real, kernels_imag
+    return torch.cat(kernels_r).to(device), torch.cat(kernels_i).to(device)
 
 
-def cwt_magnitude_conv1d(x, kernels_real, kernels_imag):
-
+def cwt_magnitude_conv1d(x, kr, ki):
     x = x.unsqueeze(1)
+    pad = kr.shape[-1]//2
 
-    kernel_size = kernels_real.shape[-1]
-    pad = kernel_size // 2
+    x = F.pad(x, (pad,pad), mode='reflect')
 
-    x_padded = F.pad(x, (pad, pad), mode='reflect')
+    real = F.conv1d(x, kr)
+    imag = F.conv1d(x, ki)
 
-    real_out = F.conv1d(x_padded, kernels_real)
-    imag_out = F.conv1d(x_padded, kernels_imag)
-
-    mag = torch.sqrt(real_out**2 + imag_out**2 + 1e-12)
-
-    return mag
+    return torch.sqrt(real**2 + imag**2 + 1e-12)
 
 
 def cosine_interp(a0, a1, alpha):
-
     mu = 0.5 * (1 - math.cos(math.pi * alpha))
-    return (1 - mu) * a0 + mu * a1
+    return (1-mu)*a0 + mu*a1
 
 
 # ------------------------------------------------------------
@@ -128,20 +102,14 @@ class PhysMambaTrainer(BaseTrainer):
         self.model_dir = config.MODEL.MODEL_DIR
         self.model_file_name = config.TRAIN.MODEL_FILE_NAME
 
-        self.batch_size = config.TRAIN.BATCH_SIZE
-        self.num_of_gpu = config.NUM_OF_GPU_TRAIN
-
-        self.min_valid_loss = None
-        self.best_epoch = 0
-
         self.model = PhysMamba(
             frames=config.TRAIN.DATA.PREPROCESS.CHUNK_LENGTH
         ).to(self.device)
 
-        if self.num_of_gpu > 0:
+        if config.NUM_OF_GPU_TRAIN > 0:
             self.model = torch.nn.DataParallel(
                 self.model,
-                device_ids=list(range(self.num_of_gpu))
+                device_ids=list(range(config.NUM_OF_GPU_TRAIN))
             )
 
         self.criterion_Pearson = Neg_Pearson()
@@ -149,7 +117,7 @@ class PhysMambaTrainer(BaseTrainer):
         self.optimizer = optim.Adam(
             self.model.parameters(),
             lr=config.TRAIN.LR,
-            weight_decay=0.0005
+            weight_decay=5e-4
         )
 
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -159,55 +127,39 @@ class PhysMambaTrainer(BaseTrainer):
             steps_per_epoch=len(data_loader["train"])
         )
 
-        # curriculum
         self.frac_fft_major = 0.4
-        self.transition_frac = 0.10
-        self.w_fft_high = 0.85
-        self.w_fft_low = 0.05
+        self.transition_frac = 0.1
 
 
     def _compute_weights(self, epoch):
 
         E = self.max_epoch_num
+        E_major = int(self.frac_fft_major * E)
+        E_transition = max(1, int(self.transition_frac * E))
 
-        E_major = int(math.floor(self.frac_fft_major * E))
-        E_transition = max(1, int(round(self.transition_frac * E)))
-
-        t_start = E_major
-        t_end = E_major + E_transition
-
-        if epoch < t_start:
-            w_fft = self.w_fft_high
-
-        elif epoch >= t_end:
-            w_fft = self.w_fft_low
-
+        if epoch < E_major:
+            w_fft = 0.85
+        elif epoch >= E_major + E_transition:
+            w_fft = 0.05
         else:
-            alpha = float(epoch - t_start) / float(max(1, t_end - t_start))
-            w_fft = cosine_interp(self.w_fft_high, self.w_fft_low, alpha)
+            alpha = (epoch - E_major) / E_transition
+            w_fft = cosine_interp(0.85, 0.05, alpha)
 
-        w_cwt = 1.0 - w_fft
+        w_cwt = min(1 - w_fft, 0.6)   # clamp CWT
 
-        return float(w_fft), float(w_cwt)
+        return w_fft, w_cwt
 
-
-    # ------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------
 
     def train(self, data_loader):
 
         sr = int(self.frame_rate)
 
         freqs = torch.linspace(0.5, 4.0, 32).tolist()
-
-        kernels_real, kernels_imag = make_morlet_bank(freqs, sr, self.device)
+        kr, ki = make_morlet_bank(freqs, sr, self.device)
 
         n_fft = 256
 
-        L0_fft = None
-        L0_cwt = None
-        eps = 1e-8
+        L0_fft, L0_cwt = None, None
 
         for epoch in range(self.max_epoch_num):
 
@@ -219,9 +171,7 @@ class PhysMambaTrainer(BaseTrainer):
 
             self.model.train()
 
-            tbar = tqdm(data_loader["train"], ncols=80)
-
-            for idx, batch in enumerate(tbar):
+            for batch in tqdm(data_loader["train"], ncols=80):
 
                 data, labels = batch[0].float(), batch[1].float()
 
@@ -230,60 +180,51 @@ class PhysMambaTrainer(BaseTrainer):
 
                 self.optimizer.zero_grad()
 
-                pred_ppg = self.model(data)
+                pred = self.model(data)
 
-                if pred_ppg.shape[-1] != labels.shape[-1]:
-
-                    pred_ppg = F.interpolate(
-                        pred_ppg.unsqueeze(1),
+                if pred.shape[-1] != labels.shape[-1]:
+                    pred = F.interpolate(
+                        pred.unsqueeze(1),
                         size=labels.shape[-1],
-                        mode="linear",
+                        mode='linear',
                         align_corners=False
                     ).squeeze(1)
 
-                # normalize prediction
-                pred_ppg = (
-                    pred_ppg - pred_ppg.mean(dim=-1, keepdim=True)
-                ) / (pred_ppg.std(dim=-1, keepdim=True) + 1e-8)
+                # normalize (FIXED)
+                pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True)+1e-8)
+                labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True)+1e-8)
 
-                # normalize labels (FIXED)
-                labels = (
-                    labels - labels.mean(dim=-1, keepdim=True)
-                ) / (labels.std(dim=-1, keepdim=True) + 1e-8)
-
-                # remove DC bias
-                pred_ppg = pred_ppg - pred_ppg.mean(dim=-1, keepdim=True)
+                # remove DC
+                pred = pred - pred.mean(dim=-1, keepdim=True)
                 labels = labels - labels.mean(dim=-1, keepdim=True)
 
-                # Pearson loss
-                L_pearson = self.criterion_Pearson(pred_ppg, labels)
+                # LOSSES
+                Lp = self.criterion_Pearson(pred, labels)
+                Lt = temporal_diff_loss(pred, labels)
+                Lb = bandpass_loss(pred, sr)
 
-                # FFT loss
-                fft_pred = spectral_log_magnitude(pred_ppg, n_fft)
-                fft_gt = spectral_log_magnitude(labels, n_fft)
-                L_fft = F.mse_loss(fft_pred, fft_gt)
+                fft_p = spectral_log_magnitude(pred, n_fft)
+                fft_t = spectral_log_magnitude(labels, n_fft)
+                Lf = F.mse_loss(fft_p, fft_t)
 
-                # CWT loss
-                cwt_pred = cwt_magnitude_conv1d(pred_ppg, kernels_real, kernels_imag)
-                cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
-
-                L_cwt = F.mse_loss(
-                    torch.log1p(cwt_pred),
-                    torch.log1p(cwt_gt)
-                )
+                cwt_p = cwt_magnitude_conv1d(pred, kr, ki)
+                cwt_t = cwt_magnitude_conv1d(labels, kr, ki)
+                Lc = F.mse_loss(torch.log1p(cwt_p), torch.log1p(cwt_t))
 
                 if L0_fft is None:
+                    L0_fft = Lf.detach()
+                    L0_cwt = Lc.detach()
 
-                    L0_fft = max(L_fft.detach().item(), 1e-6)
-                    L0_cwt = max(L_cwt.detach().item(), 1e-6)
+                Lf /= (L0_fft + 1e-8)
+                Lc /= (L0_cwt + 1e-8)
 
-                L_fft_norm = L_fft / (L0_fft + eps)
-                L_cwt_norm = L_cwt / (L0_cwt + eps)
-
+                # FINAL LOSS (KEY)
                 loss = (
-                    0.5 * L_pearson
-                    + 0.3 * w_fft * L_fft_norm
-                    + 0.2 * w_cwt * L_cwt_norm
+                    0.6 * Lp +
+                    0.15 * w_fft * Lf +
+                    0.1 * w_cwt * Lc +
+                    0.15 * Lt +
+                    0.05 * Lb
                 )
 
                 loss.backward()
@@ -293,40 +234,23 @@ class PhysMambaTrainer(BaseTrainer):
                 self.optimizer.step()
                 self.scheduler.step()
 
-                tbar.set_postfix(
-                    loss=loss.item(),
-                    pearson=L_pearson.item(),
-                    w_fft=w_fft,
-                    w_cwt=w_cwt
-                )
-
             self.save_model(epoch)
 
-            valid_loss = self.valid(data_loader)
+            val_loss = self.valid(data_loader)
+            print("validation loss:", val_loss)
 
-            print("validation loss:", valid_loss)
-
-            if self.min_valid_loss is None or valid_loss < self.min_valid_loss:
-
-                self.min_valid_loss = valid_loss
+            if self.min_valid_loss is None or val_loss < self.min_valid_loss:
+                self.min_valid_loss = val_loss
                 self.best_epoch = epoch
-
-                print("Update best model! Best epoch:", self.best_epoch)
-
-            torch.cuda.empty_cache()
+                print("Update best model! Best epoch:", epoch)
 
         print("Training finished.")
 
 
-    # ------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------
-
     def valid(self, data_loader):
 
-        valid_loss = []
-
         self.model.eval()
+        losses = []
 
         with torch.no_grad():
 
@@ -338,108 +262,81 @@ class PhysMambaTrainer(BaseTrainer):
                 pred = self.model(data)
 
                 if pred.shape[-1] != label.shape[-1]:
-
                     pred = F.interpolate(
                         pred.unsqueeze(1),
                         size=label.shape[-1],
-                        mode="linear",
+                        mode='linear',
                         align_corners=False
                     ).squeeze(1)
 
-                pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
-                label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True) + 1e-8)
+                pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True)+1e-8)
+                label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True)+1e-8)
 
                 loss = self.criterion_Pearson(pred, label)
 
-                valid_loss.append(loss.item())
+                losses.append(loss.item())
 
-        return np.mean(valid_loss)
+        return np.mean(losses)
 
-
-    # ------------------------------------------------------------
-    # Testing
-    # ------------------------------------------------------------
 
     def test(self, data_loader):
 
-        if data_loader["test"] is None:
-            raise ValueError("No data for test")
-
         print("\n===Testing===")
 
-        predictions = dict()
-        labels = dict()
-
-        if self.config.TEST.USE_LAST_EPOCH:
-
-            model_path = os.path.join(
-                self.model_dir,
-                self.model_file_name + '_Epoch' + str(self.max_epoch_num - 1) + '.pth'
-            )
-
-        else:
-
-            model_path = os.path.join(
-                self.model_dir,
-                self.model_file_name + '_Epoch' + str(self.best_epoch) + '.pth'
-            )
+        model_path = os.path.join(
+            self.model_dir,
+            self.model_file_name + f'_Epoch{self.best_epoch}.pth'
+        )
 
         print("Loading model:", model_path)
 
         self.model.load_state_dict(torch.load(model_path))
-
-        self.model = self.model.to(self.config.DEVICE)
         self.model.eval()
+
+        predictions, labels = {}, {}
 
         with torch.no_grad():
 
-            for _, test_batch in enumerate(tqdm(data_loader["test"], ncols=80)):
+            for batch in tqdm(data_loader["test"], ncols=80):
 
-                batch_size = test_batch[0].shape[0]
+                data = batch[0].to(self.device)
+                label = batch[1].to(self.device)
 
-                data = test_batch[0].to(self.config.DEVICE)
-                label = test_batch[1].to(self.config.DEVICE)
+                pred = self.model(data)
 
-                pred_ppg_test = self.model(data)
+                for i in range(data.shape[0]):
 
-                for idx in range(batch_size):
+                    subj = batch[2][i]
+                    idx = int(batch[3][i])
 
-                    subj_index = test_batch[2][idx]
-                    sort_index = int(test_batch[3][idx])
+                    if subj not in predictions:
+                        predictions[subj] = {}
+                        labels[subj] = {}
 
-                    if subj_index not in predictions:
-                        predictions[subj_index] = dict()
-                        labels[subj_index] = dict()
-
-                    predictions[subj_index][sort_index] = pred_ppg_test[idx].detach().cpu()
-                    labels[subj_index][sort_index] = label[idx].detach().cpu()
+                    predictions[subj][idx] = pred[i].cpu()
+                    labels[subj][idx] = label[i].cpu()
 
         calculate_metrics(predictions, labels, self.config)
 
 
-    # ------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------
+    def save_model(self, epoch):
 
-    def save_model(self, index):
+        os.makedirs(self.model_dir, exist_ok=True)
 
-        if not os.path.exists(self.model_dir):
-            os.makedirs(self.model_dir)
-
-        model_path = os.path.join(
+        path = os.path.join(
             self.model_dir,
-            self.model_file_name + '_Epoch' + str(index) + '.pth'
+            self.model_file_name + f'_Epoch{epoch}.pth'
         )
 
-        torch.save(self.model.state_dict(), model_path)
+        torch.save(self.model.state_dict(), path)
 
-        print("Saved Model Path:", model_path)
+        print("Saved Model Path:", path)
 
 
     def get_hr(self, y, sr=30, min=30, max=180):
 
-        p, q = welch(y, sr, nfft=1e5/sr, nperseg=np.min((len(y)-1, 256)))
+        p, q = welch(y, sr, nfft=1e5/sr, nperseg=min(len(y)-1, 256))
 
-        return p[(p > min/60) & (p < max/60)][
-            np.argmax(q[(p > min/60) & (p < max/60)])
+        return p[(p>min/60)&(p<max/60)][
+            np.argmax(q[(p>min/60)&(p<max/60)])
         ] * 60
