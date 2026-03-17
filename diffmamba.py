@@ -185,8 +185,32 @@ class MambaLayer(nn.Module):
         # MEMORY-SAFE FREQUENCY GATING
         # ---------------------------------
 
-        # 1. spatial pooling (VERY IMPORTANT)
-        pooled = out.mean(dim=[3, 4])   # (B, C, T)
+        # ---------------------------------
+        # SAFE FREQUENCY GATING
+        # ---------------------------------
+
+        if out.dim() == 5:
+            pooled = out.mean(dim=[3, 4])   # (B,C,T)
+        elif out.dim() == 3:
+            pooled = out
+        else:
+            raise ValueError(f"Unexpected shape: {out.shape}")
+
+        fft = torch.fft.rfft(pooled, dim=2)
+        mag = torch.abs(fft)
+
+        band = mag[:, :, 1:8]
+
+        weight = band.mean(dim=-1, keepdim=True)
+
+        # safer than sigmoid
+        weight = torch.clamp(weight, 0.5, 2.0)
+
+        # apply back
+        if out.dim() == 5:
+            out = out * weight.unsqueeze(-1).unsqueeze(-1)
+        else:
+            out = out * weight
 
         # 2. FFT on temporal only
         fft = torch.fft.rfft(pooled, dim=2)
