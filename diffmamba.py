@@ -157,18 +157,43 @@ class MambaLayer(nn.Module):
 
     def forward(self, x):
 
-        B,C,T,H,W = x.shape
+        B, C, T, H, W = x.shape
 
-        tokens = x.reshape(B,C,-1).transpose(-1,-2)
+        # ---------------------------------
+        # TEMPORAL TOKENIZATION (FIX)
+        # ---------------------------------
+
+        # 1. spatial averaging (core signal)
+        x_pool = x.mean(dim=[3, 4])   # (B, C, T)
+
+        # 2. weak residual (keeps spatial bias)
+        x_res = x.mean(dim=1, keepdim=True).mean(dim=[3, 4])  # (B,1,T)
+
+        # 3. combine (VERY important for stability)
+        x_temp = x_pool + 0.1 * x_res   # (B, C, T)
+
+        # 4. tokens = time
+        tokens = x_temp.transpose(1, 2)   # (B, T, C)
+
+        # ---------------------------------
+        # MAMBA
+        # ---------------------------------
 
         y = self.norm1(tokens)
-
         y = self.mamba(y)
 
         out = self.norm2(tokens + y)
 
-        return out.transpose(-1,-2).reshape(B,C,T,H,W)
+        # ---------------------------------
+        # BACK TO ORIGINAL SHAPE
+        # ---------------------------------
 
+        out = out.transpose(1, 2).unsqueeze(-1).unsqueeze(-1)  # (B, C, T, 1, 1)
+
+        # expand spatially (DO NOT learn spatial here)
+        out = out.expand(-1, -1, -1, H, W)
+
+        return out
 
 # ------------------------------------------------------------
 # Temporal Refiner
