@@ -160,20 +160,17 @@ class MambaLayer(nn.Module):
         B, C, T, H, W = x.shape
 
         # ---------------------------------
-        # TEMPORAL TOKENIZATION (FIX)
+        # REDUCED SPATIAL TOKENS (KEY FIX)
         # ---------------------------------
 
-        # 1. spatial averaging (core signal)
-        x_pool = x.mean(dim=[3, 4])   # (B, C, T)
+        # downsample spatially (keep structure!)
+        x_ds = F.avg_pool3d(x, kernel_size=(1, 4, 4), stride=(1, 4, 4))
+        # shape: (B, C, T, H/4, W/4)
 
-        # 2. weak residual (keeps spatial bias)
-        x_res = x.mean(dim=1, keepdim=True).mean(dim=[3, 4])  # (B,1,T)
+        B, C, T, Hs, Ws = x_ds.shape
 
-        # 3. combine (VERY important for stability)
-        x_temp = x_pool + 0.1 * x_res   # (B, C, T)
-
-        # 4. tokens = time
-        tokens = x_temp.transpose(1, 2)   # (B, T, C)
+        # flatten tokens
+        tokens = x_ds.reshape(B, C, T * Hs * Ws).transpose(1, 2)  # (B, N, C)
 
         # ---------------------------------
         # MAMBA
@@ -185,13 +182,13 @@ class MambaLayer(nn.Module):
         out = self.norm2(tokens + y)
 
         # ---------------------------------
-        # BACK TO ORIGINAL SHAPE
+        # RESTORE SHAPE
         # ---------------------------------
 
-        out = out.transpose(1, 2).unsqueeze(-1).unsqueeze(-1)  # (B, C, T, 1, 1)
+        out = out.transpose(1, 2).reshape(B, C, T, Hs, Ws)
 
-        # expand spatially (DO NOT learn spatial here)
-        out = out.expand(-1, -1, -1, H, W) * torch.sigmoid(x)
+        # upsample back
+        out = F.interpolate(out, size=(T, H, W), mode='trilinear', align_corners=False)
 
         return out
 
