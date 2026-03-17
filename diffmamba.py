@@ -182,13 +182,33 @@ class MambaLayer(nn.Module):
         out = self.norm2(tokens + y)
 
         # ---------------------------------
+        # FREQUENCY GATING (rPPG specific)
+        # ---------------------------------
+
+        # FFT along time
+        fft = torch.fft.rfft(out, dim=2)
+        mag = torch.abs(fft)
+
+        # focus on heart-rate band (0.7–4 Hz approx)
+        band = mag[..., 1:8]   # adjust if needed
+
+        weight = band.mean(dim=-1, keepdim=True)
+        weight = torch.sigmoid(weight)
+
+        out = out * weight.unsqueeze(-1).unsqueeze(-1)
+
+        # ---------------------------------
         # RESTORE SHAPE
         # ---------------------------------
 
         out = out.transpose(1, 2).reshape(B, C, T, Hs, Ws)
 
-        # upsample back
+        # after upsample
+        gate = torch.sigmoid(x)   # original input features
+
         out = F.interpolate(out, size=(T, H, W), mode='trilinear', align_corners=False)
+
+        out = out * gate
 
         return out
 
