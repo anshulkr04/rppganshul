@@ -182,19 +182,24 @@ class MambaLayer(nn.Module):
         out = self.norm2(tokens + y)
 
         # ---------------------------------
-        # FREQUENCY GATING (rPPG specific)
+        # MEMORY-SAFE FREQUENCY GATING
         # ---------------------------------
 
-        # FFT along time
-        fft = torch.fft.rfft(out, dim=2)
+        # 1. spatial pooling (VERY IMPORTANT)
+        pooled = out.mean(dim=[3, 4])   # (B, C, T)
+
+        # 2. FFT on temporal only
+        fft = torch.fft.rfft(pooled, dim=2)
         mag = torch.abs(fft)
 
-        # focus on heart-rate band (0.7–4 Hz approx)
-        band = mag[..., 1:8]   # adjust if needed
+        # 3. HR band selection
+        band = mag[:, :, 1:8]   # adjust if needed
 
-        weight = band.mean(dim=-1, keepdim=True)
+        # 4. compute weight
+        weight = band.mean(dim=-1, keepdim=True)  # (B, C, 1)
         weight = torch.sigmoid(weight)
 
+        # 5. apply back (lightweight broadcast)
         out = out * weight.unsqueeze(-1).unsqueeze(-1)
 
         # ---------------------------------
