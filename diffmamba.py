@@ -212,19 +212,19 @@ class MambaLayer(nn.Module):
         else:
             out = out * weight
 
-        # 2. FFT on temporal only
+        # pooled already computed → (B, C, T)
+
         fft = torch.fft.rfft(pooled, dim=2)
         mag = torch.abs(fft)
 
-        # 3. HR band selection
-        band = mag[:, :, 1:8]   # adjust if needed
+        band = mag[:, :, 1:8]
 
-        # 4. compute weight
-        weight = band.mean(dim=-1, keepdim=True)  # (B, C, 1)
-        weight = torch.sigmoid(weight)
+        weight = band.mean(dim=-1, keepdim=True)  # (B,C,1)
 
-        # 5. apply back (lightweight broadcast)
-        out = out * weight.unsqueeze(-1).unsqueeze(-1)
+        weight = torch.clamp(weight, 0.5, 2.0)
+
+        # APPLY (token-level)
+        out.mul_(weight.transpose(1, 2))   # (B,N,C) * (B,1,C)
 
         # ---------------------------------
         # RESTORE SHAPE
