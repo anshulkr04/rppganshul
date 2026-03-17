@@ -224,7 +224,12 @@ class MambaLayer(nn.Module):
         weight = torch.clamp(weight, 0.5, 2.0)
 
         # APPLY (token-level)
-        out.mul_(weight.transpose(1, 2))   # (B,N,C) * (B,1,C)
+        if out.shape[1] == weight.shape[1]:
+            # case: (B, C, N)
+            out.mul_(weight)
+        else:
+            # case: (B, N, C)
+            out.mul_(weight.squeeze(-1).unsqueeze(1))
 
         # ---------------------------------
         # RESTORE SHAPE
