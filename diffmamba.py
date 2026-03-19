@@ -1,16 +1,13 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from tools.mamba.mamba_ssm import Mamba2 as Mamba
-from timm.models.layers import DropPath, trunc_normal_
 
 
 # ------------------------------------------------------------
 # Conv Block
 # ------------------------------------------------------------
-
 def conv_block(in_channels, out_channels, kernel_size, stride, padding,
                bn=True, activation='relu'):
 
@@ -28,61 +25,40 @@ def conv_block(in_channels, out_channels, kernel_size, stride, padding,
 
 
 # ------------------------------------------------------------
-# Lateral Connection (SlowFast)
+# Frequency Attention (Improved)
 # ------------------------------------------------------------
+def frequency_attention(x):
+    B,C,T,H,W = x.shape
 
-class LateralConnection(nn.Module):
+    pooled = x.mean(dim=[3,4])  # (B,C,T)
 
-    def __init__(self, fast_channels=32, slow_channels=64):
+    fft = torch.fft.rfft(pooled, dim=2)
+    mag = torch.abs(fft)
 
-        super().__init__()
+    mag = mag / (mag.mean(dim=2, keepdim=True) + 1e-6)
 
-        self.conv = nn.Sequential(
-            nn.Conv3d(fast_channels, slow_channels,
-                      kernel_size=[3,1,1],
-                      stride=[2,1,1],
-                      padding=[1,0,0]),
-            nn.BatchNorm3d(slow_channels),
-            nn.ReLU()
-        )
+    weight = mag.mean(dim=2, keepdim=True)  # (B,C,1)
+    weight = weight.unsqueeze(-1).unsqueeze(-1)
 
-    def forward(self, slow_path, fast_path):
-
-        fast_path = self.conv(fast_path)
-
-        return slow_path + fast_path
+    return x * (1 + 0.1 * weight) + 0.05 * weight
 
 
 # ------------------------------------------------------------
 # Temporal Multi-Scale Block
 # ------------------------------------------------------------
-
 class TemporalMultiScale(nn.Module):
 
     def __init__(self, channels):
-
         super().__init__()
 
-        self.conv3 = nn.Conv3d(
-            channels, channels,
-            (3,1,1),
-            padding=(1,0,0),
-            groups=channels
-        )
+        self.conv3 = nn.Conv3d(channels, channels, (3,1,1),
+                               padding=(1,0,0), groups=channels)
 
-        self.conv7 = nn.Conv3d(
-            channels, channels,
-            (7,1,1),
-            padding=(3,0,0),
-            groups=channels
-        )
+        self.conv7 = nn.Conv3d(channels, channels, (7,1,1),
+                               padding=(3,0,0), groups=channels)
 
-        self.conv15 = nn.Conv3d(
-            channels, channels,
-            (15,1,1),
-            padding=(7,0,0),
-            groups=channels
-        )
+        self.conv15 = nn.Conv3d(channels, channels, (15,1,1),
+                                padding=(7,0,0), groups=channels)
 
         self.pointwise = nn.Conv3d(channels*3, channels, 1)
 
@@ -96,7 +72,6 @@ class TemporalMultiScale(nn.Module):
         f3 = self.conv15(x)
 
         out = torch.cat([f1,f2,f3], dim=1)
-
         out = self.pointwise(out)
         out = self.bn(out)
 
@@ -104,203 +79,112 @@ class TemporalMultiScale(nn.Module):
 
 
 # ------------------------------------------------------------
-# Periodic State Kernel
+# Multi-Scale Mamba Layer (CORE FIX)
 # ------------------------------------------------------------
-
-class PeriodicStateKernel(nn.Module):
-
-    def __init__(self, channels, fps=30):
-
-        super().__init__()
-
-        self.freq = nn.Parameter(torch.tensor(1.2))
-        self.amp = nn.Parameter(torch.ones(channels))
-
-        self.fps = fps
-
-    def forward(self, x):
-
-        B,C,T,H,W = x.shape
-
-        t = torch.arange(T, device=x.device).float() / self.fps
-
-        freq = torch.clamp(self.freq,0.7,4.0)
-
-        sinusoid = torch.sin(2*torch.pi*freq*t)
-
-        sinusoid = sinusoid.view(1,1,T,1,1)
-
-        amp = self.amp.view(1,C,1,1,1)
-
-        return x * (1 + 0.1 * amp * sinusoid)
-
-
-# ------------------------------------------------------------
-# Mamba Layer
-# ------------------------------------------------------------
-
 class MambaLayer(nn.Module):
 
-    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
-
+    def __init__(self, dim):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-        self.mamba = Mamba(
-            d_model=dim,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand
-        )
+        self.mamba_fine = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+        self.mamba_coarse = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
 
     def forward(self, x):
 
-        B, C, T, H, W = x.shape
+        B,C,T,H,W = x.shape
 
-        # ---------------------------------
-        # REDUCED SPATIAL TOKENS (KEY FIX)
-        # ---------------------------------
+        # -------- Fine branch
+        x_fine = F.avg_pool3d(x, kernel_size=(1,2,2))
+        B,C,T,Hf,Wf = x_fine.shape
 
-        # downsample spatially (keep structure!)
-        x_ds = F.avg_pool3d(x, kernel_size=(1, 4, 4), stride=(1, 4, 4))
-        # shape: (B, C, T, H/4, W/4)
+        tokens_fine = x_fine.permute(0,2,3,4,1).reshape(B, T*Hf*Wf, C)
 
-        B, C, T, Hs, Ws = x_ds.shape
+        y1 = self.norm1(tokens_fine)
+        y1 = self.mamba_fine(y1)
 
-        # flatten tokens
-        tokens = x_ds.reshape(B, C, T * Hs * Ws).transpose(1, 2)  # (B, N, C)
+        out_fine = self.norm2(tokens_fine + y1)
+        out_fine = out_fine.reshape(B,T,Hf,Wf,C).permute(0,4,1,2,3)
 
-        # ---------------------------------
-        # MAMBA
-        # ---------------------------------
+        # -------- Coarse branch
+        x_coarse = F.avg_pool3d(x, kernel_size=(1,4,4))
+        B,C,T,Hc,Wc = x_coarse.shape
 
-        y = self.norm1(tokens)
-        y = self.mamba(y)
+        tokens_coarse = x_coarse.permute(0,2,3,4,1).reshape(B, T*Hc*Wc, C)
 
-        out = self.norm2(tokens + y)
+        y2 = self.norm1(tokens_coarse)
+        y2 = self.mamba_coarse(y2)
 
-        # ---------------------------------
-        # MEMORY-SAFE FREQUENCY GATING
-        # ---------------------------------
+        out_coarse = self.norm2(tokens_coarse + y2)
+        out_coarse = out_coarse.reshape(B,T,Hc,Wc,C).permute(0,4,1,2,3)
 
-        # ---------------------------------
-        # SAFE FREQUENCY GATING
-        # ---------------------------------
+        # -------- Upsample coarse → fine
+        out_coarse = F.interpolate(out_coarse, size=(T,Hf,Wf), mode='trilinear', align_corners=False)
 
-        if out.dim() == 5:
-            pooled = out.mean(dim=[3, 4])   # (B,C,T)
-        elif out.dim() == 3:
-            pooled = out
-        else:
-            raise ValueError(f"Unexpected shape: {out.shape}")
+        # -------- Fusion
+        out = out_fine + out_coarse
 
-        fft = torch.fft.rfft(pooled, dim=2)
-        mag = torch.abs(fft)
-
-        band = mag[:, :, 1:8]
-
-        weight = band.mean(dim=-1, keepdim=True)
-
-        # safer than sigmoid
-        weight = torch.clamp(weight, 0.5, 2.0)
-
-        # apply back
-        if out.dim() == 5:
-            out = out * weight.unsqueeze(-1).unsqueeze(-1)
-        else:
-            out = out * weight
-
-        # pooled already computed → (B, C, T)
-
-        fft = torch.fft.rfft(pooled, dim=2)
-        mag = torch.abs(fft)
-
-        band = mag[:, :, 1:8]
-
-        weight = band.mean(dim=-1, keepdim=True)  # (B,C,1)
-
-        weight = torch.clamp(weight, 0.5, 2.0)
-
-        # APPLY (token-level)
-        if out.shape[1] == weight.shape[1]:
-            # case: (B, C, N)
-            out.mul_(weight)
-        else:
-            # case: (B, N, C)
-            out.mul_(weight.squeeze(-1).unsqueeze(1))
-
-        # ---------------------------------
-        # RESTORE SHAPE
-        # ---------------------------------
-
-        out = out.transpose(1, 2).reshape(B, C, T, Hs, Ws)
-
-        # after upsample
-        gate = torch.sigmoid(x)   # original input features
-
-        out = F.interpolate(out, size=(T, H, W), mode='trilinear', align_corners=False)
-
-        out = out * gate
+        # -------- Residual
+        out = out + 0.1 * x_fine
 
         return out
+
+
+# ------------------------------------------------------------
+# Lateral Connection
+# ------------------------------------------------------------
+class LateralConnection(nn.Module):
+
+    def __init__(self, fast_channels=32, slow_channels=64):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv3d(fast_channels, slow_channels,
+                      kernel_size=[3,1,1],
+                      stride=[2,1,1],
+                      padding=[1,0,0]),
+            nn.BatchNorm3d(slow_channels),
+            nn.ReLU()
+        )
+
+    def forward(self, slow, fast):
+        fast = self.conv(fast)
+        return slow + fast
+
 
 # ------------------------------------------------------------
 # Temporal Refiner
 # ------------------------------------------------------------
-
 class TemporalRefiner(nn.Module):
 
     def __init__(self, channels):
-
         super().__init__()
 
-        self.conv1 = nn.Conv3d(
-            channels,
-            channels,
-            (5,1,1),
-            padding=(2,0,0)
-        )
-
-        self.conv2 = nn.Conv3d(
-            channels,
-            channels,
-            (3,1,1),
-            padding=(1,0,0)
-        )
+        self.conv1 = nn.Conv3d(channels, channels, (5,1,1), padding=(2,0,0))
+        self.conv2 = nn.Conv3d(channels, channels, (3,1,1), padding=(1,0,0))
 
         self.bn1 = nn.BatchNorm3d(channels)
         self.bn2 = nn.BatchNorm3d(channels)
 
         self.act = nn.GELU()
 
-    def forward(self,x):
-
+    def forward(self, x):
         r = x
-
         x = self.act(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
-
-        return self.act(x+r)
+        return self.act(x + r)
 
 
 # ------------------------------------------------------------
-# PhysMamba
+# MAIN MODEL
 # ------------------------------------------------------------
-
 class PhysMamba(nn.Module):
 
-    def __init__(self,
-                 theta=0.5,
-                 frames=128):
-
+    def __init__(self, frames=128):
         super().__init__()
 
-        self.periodic_slow = PeriodicStateKernel(64)
-        self.periodic_fast = PeriodicStateKernel(32)
-
-        # Backbone
         self.ConvBlock1 = conv_block(3,16,[1,5,5],1,[0,2,2])
         self.ConvBlock2 = conv_block(16,32,[3,3,3],1,1)
         self.ConvBlock3 = conv_block(32,64,[3,3,3],1,1)
@@ -312,11 +196,9 @@ class PhysMamba(nn.Module):
 
         self.MaxpoolSpa = nn.MaxPool3d((1,2,2),(1,2,2))
 
-        # Temporal modules
         self.temporal_slow = TemporalMultiScale(64)
         self.temporal_fast = TemporalMultiScale(32)
 
-        # Mamba blocks
         self.Block1 = MambaLayer(64)
         self.Block2 = MambaLayer(64)
         self.Block3 = MambaLayer(64)
@@ -324,11 +206,9 @@ class PhysMamba(nn.Module):
         self.Block4 = MambaLayer(32)
         self.Block5 = MambaLayer(32)
 
-        # SlowFast fusion
         self.fuse_1 = LateralConnection(32,64)
         self.fuse_2 = LateralConnection(32,64)
 
-        # Upsampling
         self.upsample1 = nn.Sequential(
             nn.Upsample(scale_factor=(2,1,1)),
             nn.Conv3d(64,64,[3,1,1],padding=(1,0,0)),
@@ -345,14 +225,11 @@ class PhysMamba(nn.Module):
 
         self.refiner = TemporalRefiner(48)
 
-        self.ConvBlockLast = nn.Conv3d(48,1,[1,1,1])
-
         self.poolspa = nn.AdaptiveAvgPool3d((frames,1,1))
+        self.ConvBlockLast = nn.Conv3d(48,1,[1,1,1])
 
 
     def forward(self, x):
-
-        B,C,T,H,W = x.shape
 
         x = self.ConvBlock1(x)
         x = self.MaxpoolSpa(x)
@@ -364,8 +241,9 @@ class PhysMamba(nn.Module):
         s_x = self.ConvBlock4(x)
         f_x = self.ConvBlock5(x)
 
-        s_x = self.periodic_slow(s_x)
-        f_x = self.periodic_fast(f_x)
+        # 🔥 frequency awareness
+        s_x = frequency_attention(s_x)
+        f_x = frequency_attention(f_x)
 
         s_x = self.temporal_slow(s_x)
         f_x = self.temporal_fast(f_x)
@@ -373,13 +251,11 @@ class PhysMamba(nn.Module):
         # Stage 1
         s_x1 = self.MaxpoolSpa(self.Block1(s_x))
         f_x1 = self.MaxpoolSpa(self.Block4(f_x))
-
         s_x1 = self.fuse_1(s_x1, f_x1)
 
         # Stage 2
         s_x2 = self.MaxpoolSpa(self.Block2(s_x1))
         f_x2 = self.MaxpoolSpa(self.Block5(f_x1))
-
         s_x2 = self.fuse_2(s_x2, f_x2)
 
         # Stage 3
@@ -388,14 +264,12 @@ class PhysMamba(nn.Module):
         s_x3 = self.upsample1(s_x3)
         f_x3 = self.ConvBlock6(f_x2)
 
-        x = torch.cat((f_x3,s_x3), dim=1)
+        x = torch.cat((f_x3, s_x3), dim=1)
 
         x = self.upsample2(x)
-
         x = self.refiner(x)
 
         x = self.poolspa(x)
-
         x = self.ConvBlockLast(x)
 
         rPPG = x.squeeze(1).squeeze(-1).squeeze(-1)
