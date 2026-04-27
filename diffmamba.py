@@ -152,13 +152,22 @@ class MambaLayer(nn.Module):
         return out
 
     def forward(self, x):
+        _, _, _, H, W = x.shape
+
+        # Clamp pool kernels to the actual spatial size — by Block3 the
+        # feature map can be as small as 2×2, where a fixed 4×4 coarse
+        # pool would error out. When H/W is too small, the coarse branch
+        # degenerates to the fine resolution but its (separate) Mamba
+        # weights still contribute, so all params stay live for DDP/DP.
+        fine_kh,   fine_kw   = min(2, H), min(2, W)
+        coarse_kh, coarse_kw = min(4, H), min(4, W)
 
         # Fine branch
-        x_fine = F.avg_pool3d(x, kernel_size=(1, 2, 2))
+        x_fine = F.avg_pool3d(x, kernel_size=(1, fine_kh, fine_kw))
         out_fine = self._scan(x_fine, self.mamba_fine_fwd, self.mamba_fine_bwd)
 
         # Coarse branch
-        x_coarse = F.avg_pool3d(x, kernel_size=(1, 4, 4))
+        x_coarse = F.avg_pool3d(x, kernel_size=(1, coarse_kh, coarse_kw))
         out_coarse = self._scan(x_coarse, self.mamba_coarse_fwd, self.mamba_coarse_bwd)
 
         # Upsample coarse → fine and fuse
