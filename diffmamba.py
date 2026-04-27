@@ -152,7 +152,7 @@ class MambaLayer(nn.Module):
         return out
 
     def forward(self, x):
-        _, _, _, H, W = x.shape
+        _, _, T, H, W = x.shape
 
         # Clamp pool kernels to the actual spatial size — by Block3 the
         # feature map can be as small as 2×2, where a fixed 4×4 coarse
@@ -162,23 +162,25 @@ class MambaLayer(nn.Module):
         fine_kh,   fine_kw   = min(2, H), min(2, W)
         coarse_kh, coarse_kw = min(4, H), min(4, W)
 
-        # Fine branch
+        # Pool → Mamba scan at fine and coarse spatial resolutions
         x_fine = F.avg_pool3d(x, kernel_size=(1, fine_kh, fine_kw))
         out_fine = self._scan(x_fine, self.mamba_fine_fwd, self.mamba_fine_bwd)
 
-        # Coarse branch
         x_coarse = F.avg_pool3d(x, kernel_size=(1, coarse_kh, coarse_kw))
         out_coarse = self._scan(x_coarse, self.mamba_coarse_fwd, self.mamba_coarse_bwd)
 
-        # Upsample coarse → fine and fuse
-        _, _, Tf, Hf, Wf = out_fine.shape
-        out_coarse = F.interpolate(out_coarse, size=(Tf, Hf, Wf),
+        # Upsample both branches back to the input spatial size so
+        # MambaLayer is shape-preserving. Slow and fast pathways apply
+        # MambaLayer a different number of times; if MambaLayer reduced
+        # spatial, the two paths' final feature maps would mismatch and
+        # the closing torch.cat would fail. Only the explicit MaxpoolSpa
+        # layers (symmetric across pathways) should down-sample.
+        out_fine   = F.interpolate(out_fine,   size=(T, H, W),
+                                   mode='trilinear', align_corners=False)
+        out_coarse = F.interpolate(out_coarse, size=(T, H, W),
                                    mode='trilinear', align_corners=False)
 
-        out = out_fine + out_coarse
-        out = out + self.res_scale * x_fine
-
-        return out
+        return out_fine + out_coarse + self.res_scale * x
 
 
 # ------------------------------------------------------------
