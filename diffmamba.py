@@ -25,22 +25,41 @@ def conv_block(in_channels, out_channels, kernel_size, stride, padding,
 
 
 # ------------------------------------------------------------
-# Frequency Attention (Improved)
+# Frequency Attention (band-limited to the physiological HR range)
 # ------------------------------------------------------------
-def frequency_attention(x):
-    B,C,T,H,W = x.shape
+class FrequencyAttention(nn.Module):
+    """
+    Channel-wise attention computed *only* over the cardiac band
+    (0.5–4.0 Hz ≈ 30–240 BPM). Discarding DC drift and high-frequency
+    motion bins before pooling stops noise from bleeding into the
+    attention weights. The two mixing scalars (originally hard-coded
+    0.1 / 0.05) are made learnable.
+    """
 
-    pooled = x.mean(dim=[3,4])  # (B,C,T)
+    def __init__(self, fs=30.0, low_hz=0.5, high_hz=4.0):
+        super().__init__()
+        self.fs = fs
+        self.low_hz = low_hz
+        self.high_hz = high_hz
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+        self.beta = nn.Parameter(torch.tensor(0.05))
 
-    fft = torch.fft.rfft(pooled, dim=2)
-    mag = torch.abs(fft)
+    def forward(self, x):
+        B, C, T, H, W = x.shape
 
-    mag = mag / (mag.mean(dim=2, keepdim=True) + 1e-6)
+        pooled = x.mean(dim=[3, 4])                       # (B, C, T)
+        mag = torch.abs(torch.fft.rfft(pooled, dim=2))    # (B, C, F)
 
-    weight = mag.mean(dim=2, keepdim=True)  # (B,C,1)
-    weight = weight.unsqueeze(-1).unsqueeze(-1)
+        freqs = torch.fft.rfftfreq(T, d=1.0 / self.fs).to(x.device)
+        band = (freqs >= self.low_hz) & (freqs <= self.high_hz)
+        mag_band = mag[..., band] if band.any() else mag
 
-    return x * (1 + 0.1 * weight) + 0.05 * weight
+        mag_band = mag_band / (mag_band.mean(dim=2, keepdim=True) + 1e-6)
+
+        weight = mag_band.mean(dim=2, keepdim=True)       # (B, C, 1)
+        weight = weight.unsqueeze(-1).unsqueeze(-1)
+
+        return x * (1 + self.alpha * weight) + self.beta * weight
 
 
 # ------------------------------------------------------------
@@ -79,9 +98,26 @@ class TemporalMultiScale(nn.Module):
 
 
 # ------------------------------------------------------------
-# Multi-Scale Mamba Layer (CORE FIX)
+# Bidirectional Multi-Scale Mamba Layer
 # ------------------------------------------------------------
 class MambaLayer(nn.Module):
+    """
+    Two changes vs. the original block:
+
+    1. Bidirectional scan. Mamba2 is a causal SSM, but the BVP target is
+       non-causal — future frames carry as much info about pulse(t) as
+       past frames. We run a forward Mamba and a second Mamba on the
+       time-flipped sequence, then average.
+
+    2. Temporal-major token order. Tokens are flattened as
+       (H, W, T) → length H·W·T, so each contiguous slice of the scan is
+       one spatial location's full time sequence. The SSM hidden state
+       therefore mixes along time first, which is the dominant axis for
+       heart-rate inference. (Original order was (T, H, W), forcing the
+       state to traverse all spatial tokens between consecutive frames.)
+
+    The fine→fine residual mixing scalar is also made learnable.
+    """
 
     def __init__(self, dim):
         super().__init__()
@@ -89,45 +125,49 @@ class MambaLayer(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-        self.mamba_fine = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
-        self.mamba_coarse = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+        self.mamba_fine_fwd   = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+        self.mamba_fine_bwd   = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+        self.mamba_coarse_fwd = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+        self.mamba_coarse_bwd = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+
+        self.res_scale = nn.Parameter(torch.tensor(0.1))
+
+    @staticmethod
+    def _bidir(tokens, fwd_block, bwd_block):
+        y_fwd = fwd_block(tokens)
+        y_bwd = bwd_block(tokens.flip(dims=[1])).flip(dims=[1])
+        return 0.5 * (y_fwd + y_bwd)
+
+    def _scan(self, x_pooled, fwd_block, bwd_block):
+        B, C, T, H, W = x_pooled.shape
+
+        # (B, H, W, T, C) → temporal sub-sequences contiguous in token dim
+        tokens = x_pooled.permute(0, 3, 4, 2, 1).reshape(B, H * W * T, C)
+
+        y = self.norm1(tokens)
+        y = self._bidir(y, fwd_block, bwd_block)
+
+        out = self.norm2(tokens + y)
+        out = out.reshape(B, H, W, T, C).permute(0, 4, 3, 1, 2)
+        return out
 
     def forward(self, x):
 
-        B,C,T,H,W = x.shape
+        # Fine branch
+        x_fine = F.avg_pool3d(x, kernel_size=(1, 2, 2))
+        out_fine = self._scan(x_fine, self.mamba_fine_fwd, self.mamba_fine_bwd)
 
-        # -------- Fine branch
-        x_fine = F.avg_pool3d(x, kernel_size=(1,2,2))
-        B,C,T,Hf,Wf = x_fine.shape
+        # Coarse branch
+        x_coarse = F.avg_pool3d(x, kernel_size=(1, 4, 4))
+        out_coarse = self._scan(x_coarse, self.mamba_coarse_fwd, self.mamba_coarse_bwd)
 
-        tokens_fine = x_fine.permute(0,2,3,4,1).reshape(B, T*Hf*Wf, C)
+        # Upsample coarse → fine and fuse
+        _, _, Tf, Hf, Wf = out_fine.shape
+        out_coarse = F.interpolate(out_coarse, size=(Tf, Hf, Wf),
+                                   mode='trilinear', align_corners=False)
 
-        y1 = self.norm1(tokens_fine)
-        y1 = self.mamba_fine(y1)
-
-        out_fine = self.norm2(tokens_fine + y1)
-        out_fine = out_fine.reshape(B,T,Hf,Wf,C).permute(0,4,1,2,3)
-
-        # -------- Coarse branch
-        x_coarse = F.avg_pool3d(x, kernel_size=(1,4,4))
-        B,C,T,Hc,Wc = x_coarse.shape
-
-        tokens_coarse = x_coarse.permute(0,2,3,4,1).reshape(B, T*Hc*Wc, C)
-
-        y2 = self.norm1(tokens_coarse)
-        y2 = self.mamba_coarse(y2)
-
-        out_coarse = self.norm2(tokens_coarse + y2)
-        out_coarse = out_coarse.reshape(B,T,Hc,Wc,C).permute(0,4,1,2,3)
-
-        # -------- Upsample coarse → fine
-        out_coarse = F.interpolate(out_coarse, size=(T,Hf,Wf), mode='trilinear', align_corners=False)
-
-        # -------- Fusion
         out = out_fine + out_coarse
-
-        # -------- Residual
-        out = out + 0.1 * x_fine
+        out = out + self.res_scale * x_fine
 
         return out
 
@@ -196,6 +236,11 @@ class PhysMamba(nn.Module):
 
         self.MaxpoolSpa = nn.MaxPool3d((1,2,2),(1,2,2))
 
+        # Slow path is downsampled 4× in time vs. fast path. Use the
+        # respective effective sample rates so the band mask matches reality.
+        self.freq_attn_slow = FrequencyAttention(fs=30.0/4.0)
+        self.freq_attn_fast = FrequencyAttention(fs=30.0/2.0)
+
         self.temporal_slow = TemporalMultiScale(64)
         self.temporal_fast = TemporalMultiScale(32)
 
@@ -241,9 +286,8 @@ class PhysMamba(nn.Module):
         s_x = self.ConvBlock4(x)
         f_x = self.ConvBlock5(x)
 
-        # 🔥 frequency awareness
-        s_x = frequency_attention(s_x)
-        f_x = frequency_attention(f_x)
+        s_x = self.freq_attn_slow(s_x)
+        f_x = self.freq_attn_fast(f_x)
 
         s_x = self.temporal_slow(s_x)
         f_x = self.temporal_fast(f_x)
