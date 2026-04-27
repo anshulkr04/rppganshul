@@ -186,6 +186,28 @@ class MambaLayer(nn.Module):
 # ------------------------------------------------------------
 # Lateral Connection
 # ------------------------------------------------------------
+class ChannelGate(nn.Module):
+    """Squeeze-Excite gate. Used on the projected fast features before
+    they are added into the slow stream — lets the model suppress
+    fast-path channels that carry motion/noise instead of cardiac signal."""
+
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        B, C = x.shape[:2]
+        s = x.mean(dim=[2, 3, 4])
+        g = self.fc(s).view(B, C, 1, 1, 1)
+        return x * g
+
+
 class LateralConnection(nn.Module):
 
     def __init__(self, fast_channels=32, slow_channels=64):
@@ -200,8 +222,10 @@ class LateralConnection(nn.Module):
             nn.ReLU()
         )
 
+        self.gate = ChannelGate(slow_channels)
+
     def forward(self, slow, fast):
-        fast = self.conv(fast)
+        fast = self.gate(self.conv(fast))
         return slow + fast
 
 
@@ -236,7 +260,13 @@ class PhysMamba(nn.Module):
     def __init__(self, frames=128):
         super().__init__()
 
-        self.ConvBlock1 = conv_block(3,16,[1,5,5],1,[0,2,2])
+        # 6 input channels = 3 raw RGB + 3 temporal first-difference.
+        # The diff stream cancels static appearance (skin tone, lighting,
+        # background) and exposes the inter-frame intensity changes that
+        # carry the BVP signal. This is the central trick behind TS-CAN /
+        # EfficientPhys / DiffPhys and is the largest single accuracy
+        # lever in the rPPG literature.
+        self.ConvBlock1 = conv_block(6,16,[1,5,5],1,[0,2,2])
         self.ConvBlock2 = conv_block(16,32,[3,3,3],1,1)
         self.ConvBlock3 = conv_block(32,64,[3,3,3],1,1)
 
@@ -286,6 +316,11 @@ class PhysMamba(nn.Module):
 
 
     def forward(self, x):
+
+        # Temporal first-difference stream, padded so length matches.
+        diff = x[:, :, 1:] - x[:, :, :-1]
+        diff = F.pad(diff, (0, 0, 0, 0, 1, 0))   # (W,W,H,H,T_left,T_right)
+        x = torch.cat([x, diff], dim=1)          # (B, 6, T, H, W)
 
         x = self.ConvBlock1(x)
         x = self.MaxpoolSpa(x)

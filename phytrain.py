@@ -36,6 +36,59 @@ def temporal_diff_loss(x, y):
 
 
 # ------------------------------------------------------------
+# BAND-FOCUSED HEART-RATE LOSSES
+# ------------------------------------------------------------
+# These two losses directly target the test-time metric (FFT MAE in BPM).
+# Without them, the network only matches log-FFT magnitudes — that
+# correlates with HR error but does not optimise it.
+
+def _band_psd(x, fs, n_fft, low_hz, high_hz):
+    P = torch.abs(torch.fft.rfft(x, n=n_fft, dim=-1)) ** 2
+    freqs = torch.fft.rfftfreq(n_fft, d=1.0 / fs).to(x.device)
+    band = (freqs >= low_hz) & (freqs <= high_hz)
+    return P[..., band], freqs[band], P, freqs
+
+
+def hr_peak_loss(pred, label, fs=30.0, low_hz=0.7, high_hz=3.5,
+                 n_fft=512, temp=50.0):
+    """
+    L1 between predicted and ground-truth HR (BPM) inside the
+    physiological band, via soft-argmax over the band's PSD.
+
+    Why soft-argmax: hard argmax is non-differentiable; soft-argmax with
+    a sharp temperature on max-normalised PSD is a tight differentiable
+    surrogate for the FFT-MAE metric.
+    """
+    Pp, fb, _, _ = _band_psd(pred,  fs, n_fft, low_hz, high_hz)
+    Pl, _,  _, _ = _band_psd(label, fs, n_fft, low_hz, high_hz)
+
+    # Max-normalise per-sample so the softmax temperature behaves the
+    # same regardless of input amplitude scale.
+    Pp = Pp / (Pp.amax(dim=-1, keepdim=True) + 1e-8)
+    Pl = Pl / (Pl.amax(dim=-1, keepdim=True) + 1e-8)
+
+    soft_p = F.softmax(Pp * temp, dim=-1)
+    soft_l = F.softmax(Pl * temp, dim=-1)
+
+    hr_p = (soft_p * fb).sum(-1) * 60.0   # BPM
+    hr_l = (soft_l * fb).sum(-1) * 60.0
+    return F.l1_loss(hr_p, hr_l)
+
+
+def snr_loss(pred, fs=30.0, low_hz=0.7, high_hz=3.5, n_fft=512):
+    """
+    Negative log of (in-band power / total power). Pushes the predicted
+    spectrum to concentrate energy inside the cardiac band, suppressing
+    DC drift and high-frequency motion artefacts that otherwise compete
+    with the true HR peak.
+    """
+    Pb, _, P, _ = _band_psd(pred, fs, n_fft, low_hz, high_hz)
+    in_band = Pb.sum(-1)
+    total   = P.sum(-1) + 1e-8
+    return -torch.log(in_band / total + 1e-8).mean()
+
+
+# ------------------------------------------------------------
 # CWT (Morlet)
 # ------------------------------------------------------------
 
@@ -247,11 +300,18 @@ class PhysMambaTrainer(BaseTrainer):
                     torch.log1p(cwt_gt)
                 )
 
+                # Direct optimisers for the FFT-MAE metric: peak-position
+                # L1 in BPM, and in-band power concentration.
+                Lhr  = hr_peak_loss(pred, labels, fs=float(sr))
+                Lsnr = snr_loss(pred, fs=float(sr))
+
                 loss = (
-                    0.5 * Lp +
-                    0.2 * Lt +
-                    0.2 * w_fft * Lf +
-                    0.1 * w_cwt * Lc
+                    0.40 * Lp +
+                    0.15 * Lt +
+                    0.15 * w_fft * Lf +
+                    0.10 * w_cwt * Lc +
+                    0.40 * Lhr +
+                    0.10 * Lsnr
                 )
 
                 loss.backward()
