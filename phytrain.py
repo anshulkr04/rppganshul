@@ -249,6 +249,20 @@ def shift_invariant_loss(pred, gt, max_shift=10):
 
     return torch.min(torch.stack(losses))
 
+def distribution_loss(pred, gt, bins=50):
+
+    # normalize to [0,1]
+    pred_n = (pred - pred.min(dim=1, keepdim=True)[0]) / (pred.max(dim=1, keepdim=True)[0] - pred.min(dim=1, keepdim=True)[0] + 1e-6)
+    gt_n   = (gt - gt.min(dim=1, keepdim=True)[0]) / (gt.max(dim=1, keepdim=True)[0] - gt.min(dim=1, keepdim=True)[0] + 1e-6)
+
+    hist_pred = torch.histc(pred_n.flatten(), bins=bins, min=0, max=1)
+    hist_gt   = torch.histc(gt_n.flatten(), bins=bins, min=0, max=1)
+
+    hist_pred = hist_pred / (hist_pred.sum() + 1e-6)
+    hist_gt   = hist_gt / (hist_gt.sum() + 1e-6)
+
+    return F.kl_div(hist_pred.log(), hist_gt, reduction='batchmean')
+
 # ------------------------------------------------------------
 # TRAINER
 # ------------------------------------------------------------
@@ -382,13 +396,14 @@ class PhysMambaTrainer(BaseTrainer):
                 Lhr = soft_hr_loss(pred, labels, fs=sr)
                 Lshift = shift_invariant_loss(pred, labels)
 
+                Ldist = distribution_loss(pred, labels)
+
                 loss = (
-                    0.40 * Lp +
-                    0.20 * Lt +
-                    0.15 * Lshift +
-                    0.10 * Lf +
-                    0.10 * Lc +
-                    0.05 * Lhr
+                    0.40 * Lp +       # waveform shape
+                    0.20 * Lt +       # temporal consistency
+                    0.20 * Lshift +   # alignment (keep this)
+                    0.10 * Lf +       # frequency
+                    0.10 * Ldist      # NEW (key idea)
                 )
 
                 loss.backward()
