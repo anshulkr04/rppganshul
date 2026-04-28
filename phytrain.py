@@ -326,13 +326,13 @@ class PhysMambaTrainer(BaseTrainer):
                 
 
                 # Normalize
-                pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
+                pred = pred - pred.mean(dim=-1, keepdim=True)
                 labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
 
                 # Core losses
                 Lp = self.criterion_Pearson(pred, labels)
                 Lt = temporal_diff_loss(pred, labels)
-                Ld = strong_diff_loss(pred, labels)
+                Ld = temporal_diff_loss(pred, labels)
                 Lf = band_fft_loss(pred, labels, fs=sr)
 
                 cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
@@ -346,9 +346,9 @@ class PhysMambaTrainer(BaseTrainer):
                     0.40 * Lp +
                     0.15 * Lt +
                     0.15 * Ld +
-                    0.15 * Lf +
+                    0.12 * Lf +
                     0.10 * Lc +
-                    0.05 * Lhr
+                    0.02 * Lhr
                 )
 
                 loss.backward()
