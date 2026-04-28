@@ -30,6 +30,21 @@ def temporal_normalization(x):
     std = x.std(dim=1, keepdim=True) + 1e-6
     return (x - mean) / std
 
+def soft_hr_loss(pred, gt, fs=30):
+    pred_fft = torch.abs(torch.fft.rfft(pred, dim=1))
+    gt_fft = torch.abs(torch.fft.rfft(gt, dim=1))
+
+    freqs = torch.fft.rfftfreq(pred.shape[1], d=1/fs).to(pred.device)
+    mask = (freqs >= 0.5) & (freqs <= 4.0)
+
+    pred_fft = pred_fft[:, mask]
+    gt_fft = gt_fft[:, mask]
+
+    pred_fft = pred_fft / (pred_fft.sum(dim=1, keepdim=True) + 1e-6)
+    gt_fft = gt_fft / (gt_fft.sum(dim=1, keepdim=True) + 1e-6)
+
+    return F.kl_div(pred_fft.log(), gt_fft, reduction='batchmean')
+
 
 # ------------------------------------------------------------
 # TEMPORAL LOSS
@@ -193,6 +208,15 @@ def cycle_loss(pred, fs=30):
 
     return loss / pred.shape[0]
 
+def strong_diff_loss(pred, gt):
+    dp = pred[:,1:] - pred[:,:-1]
+    dg = gt[:,1:] - gt[:,:-1]
+
+    dp = (dp - dp.mean(dim=1, keepdim=True)) / (dp.std(dim=1, keepdim=True)+1e-6)
+    dg = (dg - dg.mean(dim=1, keepdim=True)) / (dg.std(dim=1, keepdim=True)+1e-6)
+
+    return F.l1_loss(dp, dg)
+
 # ------------------------------------------------------------
 # TRAINER
 # ------------------------------------------------------------
@@ -284,7 +308,6 @@ class PhysMambaTrainer(BaseTrainer):
             for batch in tqdm(data_loader["train"], ncols=80):
 
                 data, labels = batch[0].float(), batch[1].float()
-                data = temporal_normalization(data.view(data.shape[0], data.shape[2], -1)).view_as(data)
 
                 data = data.to(self.device)
                 labels = labels.to(self.device)
@@ -301,59 +324,32 @@ class PhysMambaTrainer(BaseTrainer):
                         align_corners=False
                     ).squeeze(1)
                 
-                pred = torch.tanh(pred)
 
                 # Normalize
                 pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
-                label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True) + 1e-8)
+                labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
 
                 # Core losses
                 Lp = self.criterion_Pearson(pred, labels)
                 Lt = temporal_diff_loss(pred, labels)
-                Ld = diff_alignment_loss(pred, labels)
-
-                # Spectral (band-limited)
+                Ld = strong_diff_loss(pred, labels)
                 Lf = band_fft_loss(pred, labels, fs=sr)
 
-                # CWT (keep as-is)
                 cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
 
-                Lc = F.mse_loss(
-                    torch.log1p(cwt_pred),
-                    torch.log1p(cwt_gt)
+                Lc = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
+
+                Lhr = soft_hr_loss(pred, labels, fs=sr)
+
+                loss = (
+                    0.40 * Lp +
+                    0.15 * Lt +
+                    0.15 * Ld +
+                    0.15 * Lf +
+                    0.10 * Lc +
+                    0.05 * Lhr
                 )
-
-                # HR LOSS (NEW)
-                hr_pred = hr_from_signal_torch(pred, fs=sr)
-                hr_gt = hr_from_signal_torch(labels, fs=sr)
-
-                Lhr = F.smooth_l1_loss(hr_pred, hr_gt)
-
-                if epoch < 5:
-                    loss = (
-                        0.7 * Lp +
-                        0.2 * Lt +
-                        0.1 * Ld
-                    )
-
-                elif epoch < 15:
-                    loss = (
-                        0.5 * Lp +
-                        0.2 * Lt +
-                        0.1 * Ld +
-                        0.2 * Lf
-                    )
-
-                else:
-                    loss = (
-                        0.35 * Lp +
-                        0.15 * Lt +
-                        0.15 * Ld +
-                        0.15 * Lf +
-                        0.10 * Lc +
-                        0.10 * Lhr
-                    )
 
                 loss.backward()
 
@@ -400,7 +396,7 @@ class PhysMambaTrainer(BaseTrainer):
                     ).squeeze(1)
 
                 # Normalize ONLY labels strongly
-                labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
+                label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True) + 1e-8)
 
                 # Pred lightly normalized (avoid destroying learned amplitude)
                 pred = pred - pred.mean(dim=-1, keepdim=True)
