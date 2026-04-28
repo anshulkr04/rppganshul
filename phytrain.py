@@ -317,6 +317,22 @@ def local_pearson_loss(pred, gt, window=30):
 
     return loss / (count + 1e-6)
 
+def signal_quality_weight(x, fs=30):
+    fft = torch.abs(torch.fft.rfft(x, dim=1))
+    freqs = torch.fft.rfftfreq(x.shape[1], d=1/fs).to(x.device)
+
+    band = (freqs >= 0.5) & (freqs <= 4.0)
+
+    signal = fft[:, band].sum(dim=1)
+    total = fft.sum(dim=1) + 1e-6
+
+    quality = signal / total  # SNR proxy
+
+    # normalize to [0,1]
+    quality = (quality - quality.min()) / (quality.max() - quality.min() + 1e-6)
+
+    return quality.detach()
+
 # ------------------------------------------------------------
 # TRAINER
 # ------------------------------------------------------------
@@ -437,9 +453,13 @@ class PhysMambaTrainer(BaseTrainer):
 
                 noise = pred - bandpass_filter(pred, fs=sr)
 
+                weights = signal_quality_weight(labels, fs=sr)  # shape: (B,)
+                weights = weights.view(-1, 1)
+
                 # Core losses
-                Lp = self.criterion_Pearson(pred, labels)
-                Lt = temporal_diff_loss(pred, labels)
+                Lp = (weights.squeeze() * self.criterion_Pearson(pred, labels)).mean()
+                Lt = (weights.squeeze() * temporal_diff_loss(pred, labels)).mean()
+                Lshift = (weights.squeeze() * shift_invariant_loss(pred, labels)).mean()
                 Ld = temporal_diff_loss(pred, labels)
                 Lf = band_fft_loss(pred, labels, fs=sr)
                 Lbp = bandpass_loss(pred, labels, fs=sr)
@@ -451,17 +471,15 @@ class PhysMambaTrainer(BaseTrainer):
                 Llocal = local_pearson_loss(pred, labels)
 
                 Lhr = soft_hr_loss(pred, labels, fs=sr)
-                Lshift = shift_invariant_loss(pred, labels)
 
                 Ldist = distribution_loss(pred, labels)
 
                 loss = (
-                    0.35 * Lp +
+                    0.40 * Lp +
                     0.20 * Lt +
                     0.20 * Lshift +
                     0.10 * Lf +
-                    0.10 * Ldist +
-                    0.05 * Llocal   # NEW (key improvement)
+                    0.10 * Ldist
                 )
 
                 loss.backward()
