@@ -300,10 +300,12 @@ class PhysMambaTrainer(BaseTrainer):
                         mode='linear',
                         align_corners=False
                     ).squeeze(1)
+                
+                pred = torch.tanh(pred)
 
                 # Normalize
                 pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
-                labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
+                label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True) + 1e-8)
 
                 # Core losses
                 Lp = self.criterion_Pearson(pred, labels)
@@ -326,18 +328,32 @@ class PhysMambaTrainer(BaseTrainer):
                 hr_pred = hr_from_signal_torch(pred, fs=sr)
                 hr_gt = hr_from_signal_torch(labels, fs=sr)
 
-                Lhr = F.l1_loss(hr_pred, hr_gt)
+                Lhr = F.smooth_l1_loss(hr_pred, hr_gt)
 
-                loss = (
-                    0.30 * Lp +       # waveform
-                    0.15 * Lt +       # temporal
-                    0.10 * Ld +       # diff
-                    0.15 * Lf +       # band FFT
-                    0.10 * Lc +       # CWT
-                    0.10 * Lhr +      # HR
-                    0.05 * peak_loss(pred, sr) +   # NEW
-                    0.05 * cycle_loss(pred, sr)    # NEW
-                )
+                if epoch < 5:
+                    loss = (
+                        0.7 * Lp +
+                        0.2 * Lt +
+                        0.1 * Ld
+                    )
+
+                elif epoch < 15:
+                    loss = (
+                        0.5 * Lp +
+                        0.2 * Lt +
+                        0.1 * Ld +
+                        0.2 * Lf
+                    )
+
+                else:
+                    loss = (
+                        0.35 * Lp +
+                        0.15 * Lt +
+                        0.15 * Ld +
+                        0.15 * Lf +
+                        0.10 * Lc +
+                        0.10 * Lhr
+                    )
 
                 loss.backward()
 
