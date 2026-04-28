@@ -343,6 +343,12 @@ class PhysMambaTrainer(BaseTrainer):
 
                 data = data.to(self.device)
                 labels = labels.to(self.device)
+                labels = F.avg_pool1d(
+                    labels.unsqueeze(1),
+                    kernel_size=9,
+                    stride=1,
+                    padding=4
+                ).squeeze(1)
 
                 self.optimizer.zero_grad()
 
@@ -378,13 +384,11 @@ class PhysMambaTrainer(BaseTrainer):
 
                 loss = (
                     0.40 * Lp +
-                    0.15 * Lt +
-                    0.15 * Ld +
+                    0.20 * Lt +
                     0.15 * Lshift +
-                    0.12 * Lf +
+                    0.10 * Lf +
                     0.10 * Lc +
-                    0.02 * Lhr +
-                    0.10 * Lbp
+                    0.05 * Lhr
                 )
 
                 loss.backward()
