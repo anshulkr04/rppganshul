@@ -263,6 +263,9 @@ def distribution_loss(pred, gt, bins=50):
 
     return F.kl_div(hist_pred.log(), hist_gt, reduction='batchmean')
 
+def noise_loss(noise):
+    return torch.mean(torch.abs(noise))
+
 # ------------------------------------------------------------
 # TRAINER
 # ------------------------------------------------------------
@@ -381,12 +384,15 @@ class PhysMambaTrainer(BaseTrainer):
                 pred = pred - pred.mean(dim=-1, keepdim=True)
                 labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
 
+                noise = pred - bandpass_filter(pred, fs=sr)
+
                 # Core losses
                 Lp = self.criterion_Pearson(pred, labels)
                 Lt = temporal_diff_loss(pred, labels)
                 Ld = temporal_diff_loss(pred, labels)
                 Lf = band_fft_loss(pred, labels, fs=sr)
                 Lbp = bandpass_loss(pred, labels, fs=sr)
+                Lnoise = noise_loss(noise)
 
                 cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
@@ -403,7 +409,8 @@ class PhysMambaTrainer(BaseTrainer):
                     0.20 * Lt +       # temporal consistency
                     0.20 * Lshift +   # alignment (keep this)
                     0.10 * Lf +       # frequency
-                    0.10 * Ldist      # NEW (key idea)
+                    0.10 * Ldist +    # NEW (key idea)
+                    0.05 * Lnoise      # NEW (key idea)
                 )
 
                 loss.backward()
