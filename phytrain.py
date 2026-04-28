@@ -279,6 +279,30 @@ def shift_invariant_loss(pred, gt, max_shift=10):
 
     return torch.min(torch.stack(losses))
 
+def temporal_quality_weights(x, fs=30, window=30):
+    B, T = x.shape
+    weights = torch.zeros_like(x)
+
+    for start in range(0, T - window, window // 2):
+        segment = x[:, start:start+window]
+
+        fft = torch.abs(torch.fft.rfft(segment, dim=1))
+        freqs = torch.fft.rfftfreq(window, d=1/fs).to(x.device)
+
+        band = (freqs >= 0.5) & (freqs <= 4.0)
+
+        signal = fft[:, band].sum(dim=1)
+        total = fft.sum(dim=1) + 1e-6
+
+        q = (signal / total)  # SNR
+
+        # normalize per batch
+        q = (q - q.min()) / (q.max() - q.min() + 1e-6)
+
+        weights[:, start:start+window] += q.unsqueeze(1)
+
+    return weights.detach()
+
 def distribution_loss(pred, gt, bins=50):
 
     # normalize to [0,1]
@@ -457,8 +481,13 @@ class PhysMambaTrainer(BaseTrainer):
                 weights = weights.view(-1, 1)
 
                 # Core losses
-                Lp = (weights.squeeze() * self.criterion_Pearson(pred, labels)).mean()
-                Lt = (weights.squeeze() * temporal_diff_loss(pred, labels)).mean()
+                tw = temporal_quality_weights(labels, fs=sr)
+
+                Lp = ((1 - tw) * 0.3 + tw) * (pred - pred.mean(dim=1, keepdim=True))
+                # apply weighting before Pearson
+                Lp = self.criterion_Pearson(pred * tw, labels * tw)
+                Lt = F.l1_loss((pred[:,1:] - pred[:,:-1]) * tw[:,1:], 
+               (labels[:,1:] - labels[:,:-1]) * tw[:,1:])
                 Lshift = (weights.squeeze() * shift_invariant_loss(pred, labels)).mean()
                 Ld = temporal_diff_loss(pred, labels)
                 Lf = band_fft_loss(pred, labels, fs=sr)
