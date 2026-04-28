@@ -217,6 +217,21 @@ def strong_diff_loss(pred, gt):
 
     return F.l1_loss(dp, dg)
 
+def shift_invariant_loss(pred, gt, max_shift=10):
+    losses = []
+
+    for shift in range(-max_shift, max_shift + 1):
+        if shift < 0:
+            loss = F.l1_loss(pred[:, :shift], gt[:, -shift:])
+        elif shift > 0:
+            loss = F.l1_loss(pred[:, shift:], gt[:, :-shift])
+        else:
+            loss = F.l1_loss(pred, gt)
+
+        losses.append(loss)
+
+    return torch.min(torch.stack(losses))
+
 # ------------------------------------------------------------
 # TRAINER
 # ------------------------------------------------------------
@@ -341,11 +356,13 @@ class PhysMambaTrainer(BaseTrainer):
                 Lc = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
 
                 Lhr = soft_hr_loss(pred, labels, fs=sr)
+                Lshift = shift_invariant_loss(pred, labels)
 
                 loss = (
                     0.40 * Lp +
                     0.15 * Lt +
                     0.15 * Ld +
+                    0.15 * Lshift +
                     0.12 * Lf +
                     0.10 * Lc +
                     0.02 * Lhr
