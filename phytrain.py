@@ -55,6 +55,23 @@ def temporal_diff_loss(x, y):
     dy = y[:, 1:] - y[:, :-1]
     return F.l1_loss(dx, dy)
 
+def bandpass_filter(x, fs=30, low=0.5, high=4.0):
+    X = torch.fft.rfft(x, dim=1)
+    freqs = torch.fft.rfftfreq(x.shape[1], d=1/fs).to(x.device)
+
+    mask = (freqs >= low) & (freqs <= high)
+
+    X_filtered = torch.zeros_like(X)
+    X_filtered[:, mask] = X[:, mask]
+
+    x_filtered = torch.fft.irfft(X_filtered, n=x.shape[1], dim=1)
+    return x_filtered
+
+def bandpass_loss(pred, gt, fs=30):
+    pred_f = bandpass_filter(pred, fs)
+    gt_f = bandpass_filter(gt, fs)
+    return F.l1_loss(pred_f, gt_f)
+
 
 # ------------------------------------------------------------
 # CWT (Morlet)
@@ -349,6 +366,7 @@ class PhysMambaTrainer(BaseTrainer):
                 Lt = temporal_diff_loss(pred, labels)
                 Ld = temporal_diff_loss(pred, labels)
                 Lf = band_fft_loss(pred, labels, fs=sr)
+                Lbp = bandpass_loss(pred, labels, fs=sr)
 
                 cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
@@ -365,7 +383,8 @@ class PhysMambaTrainer(BaseTrainer):
                     0.15 * Lshift +
                     0.12 * Lf +
                     0.10 * Lc +
-                    0.02 * Lhr
+                    0.02 * Lhr +
+                    0.10 * Lbp
                 )
 
                 loss.backward()
