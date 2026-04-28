@@ -85,7 +85,7 @@ class TemporalMultiScale(nn.Module):
 
 
 # ------------------------------------------------------------
-# DiffMamba Layer (CORE CHANGE)
+# DiffMamba Layer (STABLE VERSION)
 # ------------------------------------------------------------
 class MambaLayer(nn.Module):
 
@@ -95,26 +95,20 @@ class MambaLayer(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-        self.mamba_t1_fwd = Mamba(d_model=dim, d_state=d_state, d_conv=4, expand=2)
-        self.mamba_t1_bwd = Mamba(d_model=dim, d_state=d_state, d_conv=4, expand=2)
-        self.mamba_t2_fwd = Mamba(d_model=dim, d_state=d_state, d_conv=4, expand=2)
-        self.mamba_t2_bwd = Mamba(d_model=dim, d_state=d_state, d_conv=4, expand=2)
+        self.mamba = Mamba(d_model=dim, d_state=d_state, d_conv=4, expand=2)
 
         self.res_scale = nn.Parameter(torch.tensor(0.1))
-        self.gamma = nn.Parameter(torch.tensor(0.5))  # Diff fusion weight
+        self.gamma = nn.Parameter(torch.tensor(0.0))  # start near abs-only
 
-    @staticmethod
-    def _bidir(tokens, fwd_block, bwd_block):
-        y_fwd = fwd_block(tokens)
-        y_bwd = bwd_block(tokens.flip(dims=[1])).flip(dims=[1])
-        return 0.5 * (y_fwd + y_bwd)
+        # pre temporal filter
+        self.pre_filter = nn.Conv3d(dim, dim, (3,1,1), padding=(1,0,0), groups=dim)
 
-    def _scan(self, x_in, fwd_block, bwd_block):
-        B, C, T, H, W = x_in.shape
-        tokens = x_in.permute(0, 3, 4, 2, 1).reshape(B, H * W * T, C)
+    def _scan(self, x):
+        B, C, T, H, W = x.shape
+        tokens = x.permute(0, 3, 4, 2, 1).reshape(B, H * W * T, C)
 
         y = self.norm1(tokens)
-        y = self._bidir(y, fwd_block, bwd_block)
+        y = self.mamba(y)
 
         out = self.norm2(tokens + y)
         return out.reshape(B, H, W, T, C).permute(0, 4, 3, 1, 2)
@@ -122,47 +116,30 @@ class MambaLayer(nn.Module):
     def temporal_diff(self, x):
         x_diff = x[:,:,1:] - x[:,:,:-1]
         x_diff = F.pad(x_diff, (0,0,0,0,1,0))
+
+        mean = x_diff.mean(dim=2, keepdim=True)
+        std = x_diff.std(dim=2, keepdim=True) + 1e-5
+        x_diff = (x_diff - mean) / std
+
         return x_diff
 
     def forward(self, x):
-        _, _, T, H, W = x.shape
 
-        spa_kh, spa_kw = min(2, H), min(2, W)
-        x_pool = F.avg_pool3d(x, kernel_size=(1, spa_kh, spa_kw))
+        x = x + self.pre_filter(x)
 
-        # ----------- DIFF STREAM -----------
-        x_diff = self.temporal_diff(x_pool)
+        x_diff = self.temporal_diff(x)
 
-        # ----------- T branch -----------
-        out_abs_t1 = self._scan(x_pool, self.mamba_t1_fwd, self.mamba_t1_bwd)
-        out_diff_t1 = self._scan(x_diff, self.mamba_t1_fwd, self.mamba_t1_bwd)
+        out_abs = self._scan(x)
+        out_diff = self._scan(x_diff)
 
-        out_t1 = out_abs_t1 + self.gamma * out_diff_t1
-
-        # ----------- T/2 branch -----------
-        if T >= 2:
-            x_pool_t2 = F.avg_pool3d(x_pool, kernel_size=(2,1,1), stride=(2,1,1))
-            x_diff_t2 = self.temporal_diff(x_pool_t2)
-        else:
-            x_pool_t2 = x_pool
-            x_diff_t2 = x_diff
-
-        out_abs_t2 = self._scan(x_pool_t2, self.mamba_t2_fwd, self.mamba_t2_bwd)
-        out_diff_t2 = self._scan(x_diff_t2, self.mamba_t2_fwd, self.mamba_t2_bwd)
-
-        out_t2 = out_abs_t2 + self.gamma * out_diff_t2
-        out_t2 = F.interpolate(out_t2, size=(T, x_pool.shape[3], x_pool.shape[4]),
-                               mode='trilinear', align_corners=False)
-
-        out = 0.5 * (out_t1 + out_t2)
-        out = F.interpolate(out, size=(T, H, W),
-                            mode='trilinear', align_corners=False)
+        gate = torch.sigmoid(self.gamma)
+        out = (1 - gate) * out_abs + gate * out_diff
 
         return x + self.res_scale * out
 
 
 # ------------------------------------------------------------
-# Remaining components unchanged
+# Remaining components (unchanged)
 # ------------------------------------------------------------
 class ChannelGate(nn.Module):
     def __init__(self, channels, reduction=4):
@@ -215,7 +192,7 @@ class TemporalRefiner(nn.Module):
 
 
 # ------------------------------------------------------------
-# MAIN MODEL (unchanged except using new MambaLayer)
+# FINAL MODEL (reduced depth)
 # ------------------------------------------------------------
 class PhysMamba(nn.Module):
 
@@ -239,15 +216,12 @@ class PhysMamba(nn.Module):
         self.temporal_slow = TemporalMultiScale(64)
         self.temporal_fast = TemporalMultiScale(32)
 
+        # REDUCED DEPTH
         self.Block1 = MambaLayer(64)
         self.Block2 = MambaLayer(64)
-        self.Block3 = MambaLayer(64)
-
         self.Block4 = MambaLayer(32)
-        self.Block5 = MambaLayer(32)
 
         self.fuse_1 = LateralConnection(32,64)
-        self.fuse_2 = LateralConnection(32,64)
 
         self.upsample1 = nn.Sequential(
             nn.Upsample(scale_factor=(2,1,1)),
@@ -289,16 +263,12 @@ class PhysMamba(nn.Module):
         f_x1 = self.MaxpoolSpa(self.Block4(f_x))
         s_x1 = self.fuse_1(s_x1, f_x1)
 
-        s_x2 = self.MaxpoolSpa(self.Block2(s_x1))
-        f_x2 = self.MaxpoolSpa(self.Block5(f_x1))
-        s_x2 = self.fuse_2(s_x2, f_x2)
+        s_x2 = self.Block2(s_x1)
 
-        s_x3 = self.Block3(s_x2)
+        s_x2 = self.upsample1(s_x2)
+        f_x2 = self.ConvBlock6(f_x1)
 
-        s_x3 = self.upsample1(s_x3)
-        f_x3 = self.ConvBlock6(f_x2)
-
-        x = torch.cat((f_x3, s_x3), dim=1)
+        x = torch.cat((f_x2, s_x2), dim=1)
 
         x = self.upsample2(x)
         x = self.refiner(x)
@@ -307,5 +277,8 @@ class PhysMamba(nn.Module):
         x = self.ConvBlockLast(x)
 
         rPPG = x.squeeze(1).squeeze(-1).squeeze(-1)
+
+        # SIGNAL NORMALIZATION
+        rPPG = (rPPG - rPPG.mean(dim=1, keepdim=True)) / (rPPG.std(dim=1, keepdim=True) + 1e-6)
 
         return rPPG

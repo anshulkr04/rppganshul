@@ -111,6 +111,50 @@ def cwt_magnitude_conv1d(x, kernels_r, kernels_i):
 
 
 # ------------------------------------------------------------
+# HR LOSS (CRITICAL)
+# ------------------------------------------------------------
+def hr_from_signal_torch(x, fs=30):
+    fft = torch.abs(torch.fft.rfft(x, dim=1))
+    freqs = torch.fft.rfftfreq(x.shape[1], d=1/fs).to(x.device)
+
+    # restrict to physiological band
+    mask = (freqs >= 0.5) & (freqs <= 4.0)
+
+    fft = fft[:, mask]
+    freqs = freqs[mask]
+
+    idx = fft.argmax(dim=1)
+    hr = freqs[idx] * 60
+    return hr
+
+
+# ------------------------------------------------------------
+# BAND-LIMITED FFT LOSS
+# ------------------------------------------------------------
+def band_fft_loss(pred, gt, fs=30):
+
+    pred_fft = torch.fft.rfft(pred, dim=1)
+    gt_fft = torch.fft.rfft(gt, dim=1)
+
+    freqs = torch.fft.rfftfreq(pred.shape[1], d=1/fs).to(pred.device)
+    mask = (freqs >= 0.5) & (freqs <= 4.0)
+
+    pred_fft = torch.abs(pred_fft[:, mask])
+    gt_fft = torch.abs(gt_fft[:, mask])
+
+    return F.l1_loss(pred_fft, gt_fft)
+
+
+# ------------------------------------------------------------
+# DIFF LOSS (aligns with DiffMamba)
+# ------------------------------------------------------------
+def diff_alignment_loss(pred, gt):
+    dp = pred[:,1:] - pred[:,:-1]
+    dg = gt[:,1:] - gt[:,:-1]
+    return F.l1_loss(dp, dg)
+
+
+# ------------------------------------------------------------
 # COSINE SCHEDULER
 # ------------------------------------------------------------
 
@@ -230,15 +274,15 @@ class PhysMambaTrainer(BaseTrainer):
                 pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True) + 1e-8)
                 labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
 
-                # LOSSES
+                # Core losses
                 Lp = self.criterion_Pearson(pred, labels)
                 Lt = temporal_diff_loss(pred, labels)
+                Ld = diff_alignment_loss(pred, labels)
 
-                Lf = F.mse_loss(
-                    spectral_log_magnitude(pred),
-                    spectral_log_magnitude(labels)
-                )
+                # Spectral (band-limited)
+                Lf = band_fft_loss(pred, labels, fs=sr)
 
+                # CWT (keep as-is)
                 cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
 
@@ -247,11 +291,19 @@ class PhysMambaTrainer(BaseTrainer):
                     torch.log1p(cwt_gt)
                 )
 
+                # HR LOSS (NEW)
+                hr_pred = hr_from_signal_torch(pred, fs=sr)
+                hr_gt = hr_from_signal_torch(labels, fs=sr)
+
+                Lhr = F.l1_loss(hr_pred, hr_gt)
+
                 loss = (
-                    0.5 * Lp +
-                    0.2 * Lt +
-                    0.2 * w_fft * Lf +
-                    0.1 * w_cwt * Lc
+                    0.35 * Lp +        # waveform correlation
+                    0.15 * Lt +        # temporal smoothness
+                    0.15 * Ld +        # diff consistency (NEW)
+                    0.15 * Lf +        # band FFT (FIXED)
+                    0.10 * Lc +        # CWT
+                    0.10 * Lhr         # HR supervision (CRITICAL)
                 )
 
                 loss.backward()
@@ -298,8 +350,11 @@ class PhysMambaTrainer(BaseTrainer):
                         mode='linear'
                     ).squeeze(1)
 
-                pred = (pred - pred.mean(dim=-1, keepdim=True)) / (pred.std(dim=-1, keepdim=True)+1e-8)
-                label = (label - label.mean(dim=-1, keepdim=True)) / (label.std(dim=-1, keepdim=True)+1e-8)
+                # Normalize ONLY labels strongly
+                labels = (labels - labels.mean(dim=-1, keepdim=True)) / (labels.std(dim=-1, keepdim=True) + 1e-8)
+
+                # Pred lightly normalized (avoid destroying learned amplitude)
+                pred = pred - pred.mean(dim=-1, keepdim=True)
 
                 loss = self.criterion_Pearson(pred, label)
                 losses.append(loss.item())
