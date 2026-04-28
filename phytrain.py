@@ -25,6 +25,12 @@ def spectral_log_magnitude(x, n_fft=256):
     return torch.log1p(torch.abs(X))
 
 
+def temporal_normalization(x):
+    mean = x.mean(dim=1, keepdim=True)
+    std = x.std(dim=1, keepdim=True) + 1e-6
+    return (x - mean) / std
+
+
 # ------------------------------------------------------------
 # TEMPORAL LOSS
 # ------------------------------------------------------------
@@ -163,6 +169,30 @@ def cosine_interp(a0, a1, alpha):
     return (1 - mu) * a0 + mu * a1
 
 
+def peak_loss(pred, fs=30):
+    fft = torch.abs(torch.fft.rfft(pred, dim=1))
+    freqs = torch.fft.rfftfreq(pred.shape[1], d=1/fs).to(pred.device)
+
+    mask = (freqs >= 0.5) & (freqs <= 4.0)
+    fft = fft[:, mask]
+
+    peak = fft.max(dim=1, keepdim=True)[0]
+    energy = fft.mean(dim=1, keepdim=True)
+
+    return F.l1_loss(peak, energy * 3)  # enforce sharp peak
+
+def cycle_loss(pred, fs=30):
+    hr = hr_from_signal_torch(pred, fs)
+    period = (fs * 60 / (hr + 1e-6)).long()
+
+    loss = 0
+    for i in range(pred.shape[0]):
+        T = period[i]
+        if T < pred.shape[1]//2:
+            loss += F.l1_loss(pred[i,:-T], pred[i,T:])
+
+    return loss / pred.shape[0]
+
 # ------------------------------------------------------------
 # TRAINER
 # ------------------------------------------------------------
@@ -254,6 +284,7 @@ class PhysMambaTrainer(BaseTrainer):
             for batch in tqdm(data_loader["train"], ncols=80):
 
                 data, labels = batch[0].float(), batch[1].float()
+                data = temporal_normalization(data.view(data.shape[0], data.shape[2], -1)).view_as(data)
 
                 data = data.to(self.device)
                 labels = labels.to(self.device)
@@ -298,12 +329,14 @@ class PhysMambaTrainer(BaseTrainer):
                 Lhr = F.l1_loss(hr_pred, hr_gt)
 
                 loss = (
-                    0.35 * Lp +        # waveform correlation
-                    0.15 * Lt +        # temporal smoothness
-                    0.15 * Ld +        # diff consistency (NEW)
-                    0.15 * Lf +        # band FFT (FIXED)
-                    0.10 * Lc +        # CWT
-                    0.10 * Lhr         # HR supervision (CRITICAL)
+                    0.30 * Lp +       # waveform
+                    0.15 * Lt +       # temporal
+                    0.10 * Ld +       # diff
+                    0.15 * Lf +       # band FFT
+                    0.10 * Lc +       # CWT
+                    0.10 * Lhr +      # HR
+                    0.05 * peak_loss(pred, sr) +   # NEW
+                    0.05 * cycle_loss(pred, sr)    # NEW
                 )
 
                 loss.backward()
