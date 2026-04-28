@@ -20,6 +20,19 @@ from neural_methods.trainer.BaseTrainer import BaseTrainer
 # FFT
 # ------------------------------------------------------------
 
+def snr_loss(pred, fs=30):
+    fft = torch.abs(torch.fft.rfft(pred, dim=1))
+    freqs = torch.fft.rfftfreq(pred.shape[1], d=1/fs).to(pred.device)
+
+    band = (freqs >= 0.5) & (freqs <= 4.0)
+
+    signal_energy = fft[:, band].sum(dim=1)
+    total_energy = fft.sum(dim=1) + 1e-6
+
+    snr = signal_energy / total_energy
+
+    return 1 - snr.mean()
+
 def spectral_log_magnitude(x, n_fft=256):
     X = torch.fft.rfft(x, n=n_fft)
     return torch.log1p(torch.abs(X))
@@ -225,6 +238,23 @@ def cycle_loss(pred, fs=30):
 
     return loss / pred.shape[0]
 
+def local_phase_loss(pred, gt, window=30):
+    B, T = pred.shape
+    loss = 0
+    count = 0
+
+    for start in range(0, T - window, window // 2):
+        p = pred[:, start:start+window]
+        g = gt[:, start:start+window]
+
+        p = p - p.mean(dim=1, keepdim=True)
+        g = g - g.mean(dim=1, keepdim=True)
+
+        loss += F.l1_loss(p, g)
+        count += 1
+
+    return loss / (count + 1e-6)
+
 def strong_diff_loss(pred, gt):
     dp = pred[:,1:] - pred[:,:-1]
     dg = gt[:,1:] - gt[:,:-1]
@@ -392,12 +422,12 @@ class PhysMambaTrainer(BaseTrainer):
                 Ld = temporal_diff_loss(pred, labels)
                 Lf = band_fft_loss(pred, labels, fs=sr)
                 Lbp = bandpass_loss(pred, labels, fs=sr)
-                Lnoise = noise_loss(noise)
-
+                Lsnr = snr_loss(pred, fs=sr)
                 cwt_pred = cwt_magnitude_conv1d(pred, kernels_real, kernels_imag)
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
 
                 Lc = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
+                Llocal = local_phase_loss(pred, labels)
 
                 Lhr = soft_hr_loss(pred, labels, fs=sr)
                 Lshift = shift_invariant_loss(pred, labels)
@@ -405,12 +435,12 @@ class PhysMambaTrainer(BaseTrainer):
                 Ldist = distribution_loss(pred, labels)
 
                 loss = (
-                    0.40 * Lp +       # waveform shape
-                    0.20 * Lt +       # temporal consistency
-                    0.20 * Lshift +   # alignment (keep this)
-                    0.10 * Lf +       # frequency
-                    0.10 * Ldist +    # NEW (key idea)
-                    0.05 * Lnoise      # NEW (key idea)
+                    0.35 * Lp +
+                    0.20 * Lt +
+                    0.20 * Lshift +
+                    0.10 * Lf +
+                    0.10 * Ldist +
+                    0.05 * Llocal   # NEW (key improvement)
                 )
 
                 loss.backward()
