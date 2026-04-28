@@ -296,6 +296,27 @@ def distribution_loss(pred, gt, bins=50):
 def noise_loss(noise):
     return torch.mean(torch.abs(noise))
 
+def local_pearson_loss(pred, gt, window=30):
+    B, T = pred.shape
+    loss = 0
+    count = 0
+
+    for start in range(0, T - window, window // 2):
+        p = pred[:, start:start+window]
+        g = gt[:, start:start+window]
+
+        p = p - p.mean(dim=1, keepdim=True)
+        g = g - g.mean(dim=1, keepdim=True)
+
+        numerator = (p * g).sum(dim=1)
+        denominator = torch.sqrt((p**2).sum(dim=1) * (g**2).sum(dim=1) + 1e-6)
+
+        corr = numerator / denominator
+        loss += (1 - corr).mean()
+        count += 1
+
+    return loss / (count + 1e-6)
+
 # ------------------------------------------------------------
 # TRAINER
 # ------------------------------------------------------------
@@ -427,7 +448,7 @@ class PhysMambaTrainer(BaseTrainer):
                 cwt_gt = cwt_magnitude_conv1d(labels, kernels_real, kernels_imag)
 
                 Lc = F.mse_loss(torch.log1p(cwt_pred), torch.log1p(cwt_gt))
-                Llocal = local_phase_loss(pred, labels)
+                Llocal = local_pearson_loss(pred, labels)
 
                 Lhr = soft_hr_loss(pred, labels, fs=sr)
                 Lshift = shift_invariant_loss(pred, labels)
